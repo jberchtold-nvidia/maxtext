@@ -222,8 +222,13 @@ def get_mlp_block(cfg):
     }
     lnmlp_expected_args["dtype"] = kwargs["weight_dtype"]
     lnmlp_expected_args["layernorm_type"] = "rmsnorm"
-    lnmlp_expected_args["kernel_axes_1"] = ("embed", None, "mlp")
+    lnmlp_expected_args["scale_axes"] = ("norm",)
+    lnmlp_expected_args["ln_bias_axes"] = ("norm",)
+    lnmlp_expected_args["kernel_axes_1"] = ("embed", "num_activations", "mlp")
     lnmlp_expected_args["kernel_axes_2"] = ("mlp", "embed")
+    lnmlp_expected_args["bias_axes_1"] = ("num_activations", "mlp")
+    lnmlp_expected_args["bias_axes_2"] = ("embed",)
+    lnmlp_expected_args["dot_2_input_axes"] = ("activation_batch", "activation_length", "activation_mlp")
     lnmlp_expected_args["return_layernorm_output"] = False
     te_lnmlp_initialized = LayerNormMLP(**lnmlp_expected_args)
 
