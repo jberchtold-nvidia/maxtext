@@ -900,8 +900,7 @@ def train_loop(config, state=None):
         else:
           print("No Fp8 call!")
 
-      import transformer_engine.jax.flax as te_flax
-      with mesh, nn_partitioning.axis_rules(te_flax.extend_logical_axis_rules(config.logical_axis_rules)):
+      with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
         # with open(f'jaxpr-{'te' if config.te_dense_general else 'base'}.txt', 'w+') as f:
         #   # f.write(str(jax.make_jaxpr(p_train_step)(state, example_batch, nextrng)))
         #   f.write(repr(jax.make_jaxpr(p_train_step)(state, example_batch, nextrng)))
@@ -952,8 +951,7 @@ def train_loop(config, state=None):
       for eval_batch in eval_data_iterator:
         if config.eval_steps > 0 and eval_step_count >= config.eval_steps:
           break
-        import transformer_engine.jax.flax as te_flax
-        with mesh, nn_partitioning.axis_rules(te_flax.extend_logical_axis_rules(config.logical_axis_rules)):
+        with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
           eval_metrics = p_eval_step(state, eval_batch, nextrng)
         cumulative_eval_metrics["scalar"]["eval/total_loss"] += float(eval_metrics["scalar"]["evaluation/total_loss"])
         cumulative_eval_metrics["scalar"]["eval/total_weights"] += float(eval_metrics["scalar"]["evaluation/total_weights"])
@@ -1007,8 +1005,7 @@ def train_loop(config, state=None):
   metric_logger.write_metrics(running_gcs_metrics, metrics, config.steps - 1)  # final step metrics
   max_utils.close_summary_writer(writer)
   record_goodput(recorder, config, recorder.record_job_end_time if recorder else None)
-  import transformer_engine.jax.flax as te_flax
-  with mesh, nn_partitioning.axis_rules(te_flax.extend_logical_axis_rules(config.logical_axis_rules)):
+  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
     # pytype: disable=attribute-error
     compiled = p_train_step.lower(state, example_batch, nextrng).compile()
     compiled_stats = compiled.memory_analysis()
