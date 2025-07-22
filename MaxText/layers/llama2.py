@@ -33,7 +33,7 @@ from MaxText.layers import quantizations
 from MaxText.layers.attentions import Attention
 from MaxText.layers.quantizations import AqtQuantization as Quant
 from MaxText.layers.normalizations import RMSNorm, get_norm_layer
-from MaxText.layers.linears import get_mlp_block
+from MaxText.layers.linears import get_mlp_block, DenseGeneral
 
 # -----------------------------------------
 # The Decoder Layer specific for Llama2
@@ -65,19 +65,30 @@ class LlamaDecoderLayer(nn.Module):
     inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
 
     inputs = checkpoint_name(inputs, "decoder_layer_input")
-    fuse_norm_with_qkv_proj = cfg.te_norm and cfg.te_dense_general
-    if not fuse_norm_with_qkv_proj:
-        lnx_rms = get_norm_layer(cfg)(
-            dtype=cfg.dtype,
-            weight_dtype=cfg.weight_dtype,
-            name="pre_self_attention_layer_norm",
-            kernel_axes=("norm",),
-            epsilon=cfg.normalization_layer_epsilon,
-        )
-        lnx = lnx_rms(inputs)
-        lnx = nn.with_logical_constraint(lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
-    else:
-        lnx = inputs
+
+    # layer_output = DenseGeneral(
+    #     features=cfg.base_mlp_dim,
+    #     dtype=cfg.dtype,
+    #     weight_dtype=cfg.weight_dtype,
+    #     # kernel_init=self.kernel_init,
+    #     kernel_axes=("activation_embed", "activation_batch"),
+    #     name="test_dense",
+    #     quant=self.quant,
+    #     use_bias=False,
+    #     matmul_precision=cfg.matmul_precision,
+    #     dot_kernel="te_dot" if cfg.te_dense_general else None,
+    # )(inputs)
+
+
+    lnx_rms = get_norm_layer(cfg)(
+        dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
+        name="pre_self_attention_layer_norm",
+        kernel_axes=("norm",),
+        epsilon=cfg.normalization_layer_epsilon,
+    )
+    lnx = lnx_rms(inputs)
+    lnx = nn.with_logical_constraint(lnx, ("activation_batch", "activation_norm_length", "activation_embed"))
 
     # Self-attention block
     attention_layer = Attention(
@@ -103,7 +114,6 @@ class LlamaDecoderLayer(nn.Module):
         reshape_q=cfg.reshape_q,
         use_ragged_attention=cfg.use_ragged_attention,
         ragged_block_size=cfg.ragged_block_size,
-        norm_inputs=fuse_norm_with_qkv_proj,
     )
 
     attention_lnx = attention_layer(

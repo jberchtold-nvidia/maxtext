@@ -1246,8 +1246,6 @@ class Attention(nn.Module):
   is_nope_layer: bool = False
   is_vision: bool = False
 
-  norm_inputs: bool = False  # Whether to apply normalization to inputs before attention.
-
   def setup(self):
     """init with attention_op and possibly paged_attention_op"""
     self.attention_op = AttentionOp(
@@ -1357,42 +1355,22 @@ class Attention(nn.Module):
     )(inputs_kv)
     return kv_proj
 
-  def qkv_projection(self, inputs: Array, proj_name: str, norm_inputs: bool = False):
+  def qkv_projection(self, inputs: Array, proj_name: str):
     """Fused QKV projection"""
 
-    if self.norm_inputs and self.config.te_dense_general and self.config.te_norm:
-      features = (3, self.num_query_heads, self.head_dim)
-      kernel_in_axis = np.arange(0)
-      kernel_out_axis = np.arange(0, 0 + len(features))
-      lnx_rms = TELayerNormDenseGeneral(
-        features=features,
+    qkv_proj = DenseGeneral(
+        features=(3, self.num_query_heads, self.head_dim),
         axis=-1,
-        dtype=self.config.dtype,
-        name="pre_self_attention_layer_norm",
-        scale_axes=("norm",),
-        ln_bias_axes=("norm",),
-        kernel_init=partial(self.kernel_init, in_axis=kernel_in_axis, out_axis=kernel_out_axis),
+        kernel_init=self.kernel_init,
         kernel_axes=("embed", "qkv", "heads", "kv"),
-        dot_input_axes=("activation_batch", "activation_norm_length", "activation_embed"),
-        epsilon=self.config.normalization_layer_epsilon,
-        return_layernorm_output=False,
-      )
-      qkv_proj, _ = lnx_rms(inputs)
-
-    else:
-      qkv_proj = DenseGeneral(
-          features=(3, self.num_query_heads, self.head_dim),
-          axis=-1,
-          kernel_init=self.kernel_init,
-          kernel_axes=("embed", "qkv", "heads", "kv"),
-          dtype=self.dtype,
-          weight_dtype=self.weight_dtype,
-          name=proj_name,
-          quant=self.quant,
-          matmul_precision=self.config.matmul_precision,
-          use_bias=self.use_bias_in_projections,
-          dot_kernel="te_dot" if self.config.te_dense_general else None
-      )(inputs)
+        dtype=self.dtype,
+        weight_dtype=self.weight_dtype,
+        name=proj_name,
+        quant=self.quant,
+        matmul_precision=self.config.matmul_precision,
+        use_bias=self.use_bias_in_projections,
+        dot_kernel="te_dot" if self.config.te_dense_general else None
+    )(inputs)
     qkv_proj = checkpoint_name(qkv_proj, "qkv_proj")
     query, key, value = qkv_proj[:, :, 0, ...], qkv_proj[:, :, 1, ...], qkv_proj[:, :, 2, ...]
     return query, key, value
@@ -1545,11 +1523,9 @@ class Attention(nn.Module):
       inputs_q = nn.with_logical_constraint(inputs_q, self.decode_input_axis_names)
       inputs_kv = nn.with_logical_constraint(inputs_kv, self.decode_input_axis_names)
 
-    assert not self.norm_inputs or self.config.fused_qkv, "norm_inputs is only supported with fused_qkv=True"
-
     # apply projection.
     if self.config.fused_qkv:
-      query, key, value = self.qkv_projection(inputs_q, proj_name="qkv_proj", norm_inputs=self.norm_inputs)
+      query, key, value = self.qkv_projection(inputs_q, proj_name="qkv_proj")
     else:
       query = self.query_projection(inputs_q)
       key = self.kv_projection(inputs_kv, proj_name="key")
