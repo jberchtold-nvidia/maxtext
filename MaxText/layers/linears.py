@@ -230,6 +230,8 @@ def get_mlp_block(cfg):
     lnmlp_expected_args["bias_axes_2"] = ("embed",)
     lnmlp_expected_args["dot_2_input_axes"] = ("activation_batch", "activation_length", "activation_mlp")
     lnmlp_expected_args["return_layernorm_output"] = False
+    lnmlp_expected_args["ffn1_ckpt_name"] = "mlpwi"
+    lnmlp_expected_args["ffn2_ckpt_name"] = "mlpwo"
     te_lnmlp_initialized = LayerNormMLP(**lnmlp_expected_args)
 
 

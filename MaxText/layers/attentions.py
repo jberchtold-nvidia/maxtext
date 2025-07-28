@@ -858,6 +858,7 @@ class AttentionOp(nn.Module):
         window_size=sliding_window_size,
         context_parallel_causal_load_balanced=self.config.context_parallel_load_balance,
         context_parallel_axis="context",
+        context_checkpoint_name="context",
     )
     return dpa_layer(query, key, value, mask=attn_mask)
 
