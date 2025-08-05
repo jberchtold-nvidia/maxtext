@@ -96,7 +96,7 @@ class DenseGeneral(nn.Module):
   use_bias: bool = False
   matmul_precision: str = "default"
   parameter_memory_host_offload: bool = False
-  dot_kernel: str = "te_dot"
+  dot_kernel: str = ""
 
   @nn.compact
   def __call__(self, inputs: Array) -> Array:
