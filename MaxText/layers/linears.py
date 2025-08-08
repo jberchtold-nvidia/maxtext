@@ -228,6 +228,8 @@ def get_mlp_block(cfg):
     lnmlp_expected_args["kernel_axes_2"] = ("mlp", "embed")
     lnmlp_expected_args["bias_axes_1"] = ("num_activations", "mlp")
     lnmlp_expected_args["bias_axes_2"] = ("embed",)
+    lnmlp_expected_args["dot_1_input_axes"] = ("activation_batch", "activation_norm_length",
+                                               "activation_embed")
     lnmlp_expected_args["dot_2_input_axes"] = ("activation_batch", "activation_length", "activation_mlp")
     lnmlp_expected_args["return_layernorm_output"] = False
     lnmlp_expected_args["ffn1_ckpt_name"] = "mlpwi"
