@@ -52,7 +52,7 @@ usage() {
     exit $1
 }
 
-args=$(getopt -o a:b:s:o:n:h --long additional-args:,mem-fraction:,model-name:,decoder-block:,attn-type:,remat-policy:,batch-per-gpu:,dtype:,steps:,help,multiprocess,output:,data-parallel:,fsdp:,tensor-parallel:,tensor-sequence-parallel:,pipeline-parallel:,nodes,te-norm:,te-dense:,te-mlp:,te-fp8:,te-recipe: -- "$@")
+args=$(getopt -o a:b:s:o:n:h --long additional-args:,mem-fraction:,model-name:,decoder-block:,attn-type:,remat-policy:,batch-per-gpu:,dtype:,steps:,help,multiprocess,output:,data-parallel:,fsdp:,tensor-parallel:,tensor-sequence-parallel:,pipeline-parallel:,nodes,trace:,te-norm:,te-dense:,te-mlp:,te-fp8:,te-recipe: -- "$@")
 if [[ $? -ne 0 ]]; then
     exit $1
 fi
@@ -302,7 +302,7 @@ export XLA_FLAGS="$BASE_XLA_FLAGS ${XLA_FLAGS:-}"
 RUN_NAME="logdir" ## the RUN_NAME cannot be changed
 
 PROFILE_SKIP_STEPS=$(($STEPS-1))
-PROFILER=""
+PROFILER=\'\'   # empty = no profiler
 [[ "$TRACE" == "true" ]] && PROFILER="xplane"
 
 if [ -z "$DECODER_BLOCK" ]; then

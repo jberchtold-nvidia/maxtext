@@ -56,22 +56,17 @@ MAXTEXT_DIR="$(realpath "$SCRIPT_DIR/../../")"
 OUTPUT_DIR="${SCRIPT_DIR}/output/${MODEL}${OUTPUT_DIR_TAG:+_$OUTPUT_DIR_TAG}_${TIMESTAMP}"
 mkdir -p "$OUTPUT_DIR"
 
-BASE_ARGS="--model $MODEL --steps $STEPS"
-TE_BASE_ARGS="--te-dense true --te_mlp true --te-norm true"
-TE_RECIPES=("DelayedScaling" "MXFP8BlockScaling")
-TE_ENV="NVTE_JAX_CUSTOM_CALLS='NormFwdPrimitive=false,NormBwdPrimitive=false,GemmPrimitive=true'"
-  
 n_gpus=$(nvidia-smi -L | wc -l)
 half_gpus=$((n_gpus / 2))
 # List of experiments: <DP> <TP> <TPSP> <FSDP>
 experiments=(
-  # "1        $n_gpus     1           1"        # Single DP, full TP
+  "1        $n_gpus     1           1"        # Single DP, full TP
   "$n_gpus  1           1           1"        # Full DP, single TP
-  # "2        $half_gpus  1           1"        # DP=2, TP=half GPUs
-  # "1        1           $n_gpus     1"        # Sequence parallelism maxed
-  # "2        1           $half_gpus  1"        # DP=2, TPSP=half GPUs
-  # "1        1           1           $n_gpus"  # FSDP across all GPUs
-  # "1        1           $half_gpus  2"        # FSDP=2, TPSP=half GPUs
+  "2        $half_gpus  1           1"        # DP=2, TP=half GPUs
+  "1        1           $n_gpus     1"        # Sequence parallelism maxed
+  "2        1           $half_gpus  1"        # DP=2, TPSP=half GPUs
+  "1        1           1           $n_gpus"  # FSDP across all GPUs
+  "1        1           $half_gpus  2"        # FSDP=2, TPSP=half GPUs
 )
 
 CSV="$OUTPUT_DIR/raw_results.csv"
@@ -114,13 +109,18 @@ else:
     if [[ -n "$TRACE_SRC" && -e "$TRACE_SRC" ]]; then
       TRACE_DEST="${OUTPUT_DIR}/trace_${test}_dp${dp}_tp${tp}_tpsp${tpsp}_fsdp${fsdp}"
       mv "$TRACE_SRC" "$TRACE_DEST"
-      echo "Trace moved: $TRACE_SRC -> $TRACE_DEST"
+      echo " === Trace moved: $TRACE_SRC -> $TRACE_DEST"
     else
-      echo "No trace file found for $test, dp=$dp, tp=$tp, tpsp=$tpsp, fsdp=$fsdp"
+      echo "=== No trace file found for $test, dp=$dp, tp=$tp, tpsp=$tpsp, fsdp=$fsdp"
     fi
   fi
 }
 
+BASE_ARGS="--model $MODEL --steps $STEPS"
+TE_BASE_ARGS="--te-dense true --te-mlp true --te-norm true"
+TE_RECIPES=("DelayedScaling" "MXFP8BlockScaling")
+
+export NVTE_JAX_CUSTOM_CALLS='NormFwdPrimitive=false,NormBwdPrimitive=false'
 
 for exp in "${experiments[@]}"; do
   read dp tp tpsp fsdp <<< "$exp"
@@ -130,18 +130,18 @@ for exp in "${experiments[@]}"; do
   # MaxText FP8 baseline
   test=maxtext_fp8
   run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
-    "env PYTHONPATH=${MAXTEXT_DIR}:\$PYTHONPATH bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --dtype=fp8 --trace=$TRACE $BASE_ARGS"
+    "env PYTHONPATH=${MAXTEXT_DIR}:\$PYTHONPATH bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --dtype=fp8 trace=$TRACE $BASE_ARGS"
 
   # TE variants
   for recipe in "${TE_RECIPES[@]}"; do
     test="te_fp8_${recipe}"
     TE_ARGS_ALL="$TE_BASE_ARGS --te-fp8 true --te-recipe $recipe"
     run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
-      "env $TE_ENV PYTHONPATH=${MAXTEXT_DIR}:\$PYTHONPATH bash ${SCRIPT_DIR}/test-maxtext-te.sh $args $TE_ARGS_ALL --trace=$TRACE $BASE_ARGS"
+      "env PYTHONPATH=${MAXTEXT_DIR}:\$PYTHONPATH bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --trace $TRACE $TE_ARGS_ALL $BASE_ARGS"
   done
 done
 
 OUTPUT_FORMAT="txt" # txt or csv
-echo "Experiments finished. Raw CSV at $CSV"
+echo "=== Experiments finished. Raw CSV at $CSV"
 python3 $SCRIPT_DIR/normalize.py "$CSV" "${OUTPUT_DIR}/summary.$OUTPUT_FORMAT" "$OUTPUT_FORMAT"
 cat "${OUTPUT_DIR}/summary.$OUTPUT_FORMAT"
