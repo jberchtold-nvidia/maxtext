@@ -386,6 +386,6 @@ else
 fi
 
 echo "Command: python3 $RUN_SETTINGS"
-python3 $RUN_SETTINGS
+PYTHONPATH=${MAXTEXT_DIR}:$PYTHONPATH python3 $RUN_SETTINGS
 
 echo "Output at ${OUTPUT}"

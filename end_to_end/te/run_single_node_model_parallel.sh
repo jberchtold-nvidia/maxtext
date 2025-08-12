@@ -130,14 +130,14 @@ for exp in "${experiments[@]}"; do
   # MaxText FP8 baseline
   test=maxtext_fp8
   run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
-    "env PYTHONPATH=${MAXTEXT_DIR}:\$PYTHONPATH bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --dtype=fp8 trace=$TRACE $BASE_ARGS"
+    "bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --dtype=fp8 trace=$TRACE $BASE_ARGS"
 
   # TE variants
   for recipe in "${TE_RECIPES[@]}"; do
     test="te_fp8_${recipe}"
     TE_ARGS_ALL="$TE_BASE_ARGS --te-fp8 true --te-recipe $recipe"
     run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
-      "env PYTHONPATH=${MAXTEXT_DIR}:\$PYTHONPATH bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --trace $TRACE $TE_ARGS_ALL $BASE_ARGS"
+      "bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --trace $TRACE $TE_ARGS_ALL $BASE_ARGS"
   done
 done
 
