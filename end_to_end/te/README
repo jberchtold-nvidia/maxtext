@@ -1,0 +1,32 @@
+1. Run a single test
+- MaxText with FP8
+```
+bash test-maxtext-te.sh --data-parallel=1 --tensor-parallel=1 --tensor-sequence-parallel=1
+--fsdp=1 --dtype fp8 --model llama3.1-8b --steps 100
+```
+
+- TE with DelayedScaling
+```
+bash test-maxtext-te.sh --data-parallel=1 --tensor-parallel=1 --tensor-sequence-parallel=1 --fsdp=1 --te-dense true --te-mlp true --te-norm true --te-fp8 true --te-recipe DelayedScaling --model llama3.1-8b --steps 100
+```
+
+- TE with MXFP8
+```
+bash test-maxtext-te.sh --data-parallel=1 --tensor-parallel=1 --tensor-sequence-parallel=1 --fsdp=1
+--te-dense true --te-mlp true --te-norm true --te-fp8 true --te-recipe MXFP8BlockScaling --model llama3.1-8b --steps 100
+```
+- TE with DelayedScaling + Tracing
+Xplane is used by default. Only traces of the last step is collected.
+```
+bash test-maxtext-te.sh --data-parallel=1 --tensor-parallel=1 --tensor-sequence-parallel=1 --fsdp=1
+--te-dense true --te-mlp true --te-norm true --te-fp8 true --te-recipe DelayedScaling --model
+llama3.1-8b --steps 100 --trace true
+```
+
+2. Run a regression test
+This test run all combinations of DP, TP, TPSP, FSDP of the MaxText baseline and TE recipes.
+At the end of the test, it collects all the traces, stdout, and average performance.
+Besides, performance normalized by MaxText baseline is also performance.
+```
+bash run_single_node_model_parallel.sh --model llama3.1-8b --steps 100 --trace true
+```
