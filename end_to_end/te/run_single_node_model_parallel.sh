@@ -7,6 +7,9 @@ OUTPUT_DIR_TAG=""
 STEPS=50
 TRACE=false
 
+NEW_MAXTEXT_DIR=/mnt/jberchtold/lustre-home/maxtext
+OLD_MAXTEXT_DIR=/mnt/jberchtold/lustre-home/te_maxtext_integration/maxtext
+
 # Parse keyword-style arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -56,14 +59,16 @@ MAXTEXT_DIR="$(realpath "$SCRIPT_DIR/../../")"
 OUTPUT_DIR="${SCRIPT_DIR}/output/${MODEL}${OUTPUT_DIR_TAG:+_$OUTPUT_DIR_TAG}_${TIMESTAMP}"
 mkdir -p "$OUTPUT_DIR"
 
+  # "1        $n_gpus     1           1"        # Single DP, full TP
+  # "$n_gpus  1           1           1"        # Full DP, single TP
+  # "2        $half_gpus  1           1"        # DP=2, TP=half GPUs
+  # "1        1           $n_gpus     1"        # Sequence parallelism maxed
+
 n_gpus=$(nvidia-smi -L | wc -l)
 half_gpus=$((n_gpus / 2))
+echo "Detected $n_gpus GPUs, using half_gpus=$half_gpus"
 # List of experiments: <DP> <TP> <TPSP> <FSDP>
 experiments=(
-  "1        $n_gpus     1           1"        # Single DP, full TP
-  "$n_gpus  1           1           1"        # Full DP, single TP
-  "2        $half_gpus  1           1"        # DP=2, TP=half GPUs
-  "1        1           $n_gpus     1"        # Sequence parallelism maxed
   "2        1           $half_gpus  1"        # DP=2, TPSP=half GPUs
   "1        1           1           $n_gpus"  # FSDP across all GPUs
   "1        1           $half_gpus  2"        # FSDP=2, TPSP=half GPUs
@@ -82,7 +87,7 @@ run_and_parse() {
   local stdout="$OUTPUT_DIR/run_${test}_dp${dp}_tp${tp}_tpsp${tpsp}_fsdp${fsdp}.log"
   echo "===== Executing ${test}\t${dp}\t${tp}\t${tpsp}\t${fsdp} ====="
   set +e
-  $cmd 2>&1 | tee "$stdout"
+  $cmd 2>&1 --additional-args="scan_layers=true fused_mlp=true" | tee "$stdout"
   set -e
   # Exclude the warning steps for warning up and last step for tracing
   ths=$(grep 'Tokens/s/device:' "$stdout" | sed '1,'"${WARMUP_STEPS}"'d;$d' | awk -F'Tokens/s/device: ' '{print $2}' | awk -F',' '{print $1}')
@@ -116,11 +121,24 @@ else:
   fi
 }
 
-BASE_ARGS="--model $MODEL --steps $STEPS"
-TE_BASE_ARGS="--te-dense true --te-mlp true --te-norm true"
-TE_RECIPES=("DelayedScaling" "MXFP8BlockScaling")
+quantization_to_te_recipe() {
+  local quant="$1"
+  case "$quant" in
+    te_fp8_delayedscaling)
+      echo "DelayedScaling"
+      ;;
+    te_mxfp8)
+      echo "MXFP8BlockScaling"
+      ;;
+    *)
+      echo "Unknown"
+      ;;
+  esac
+}
 
-export NVTE_JAX_CUSTOM_CALLS='NormFwdPrimitive=false,NormBwdPrimitive=false'
+BASE_ARGS="--model $MODEL --steps $STEPS"
+TE_RECIPES=("te_fp8_delayedscaling" "te_mxfp8")
+export NVTE_JAX_CUSTOM_CALLS='GemmPrimitive=true,NormFwdPrimitive=false,NormBwdPrimitive=false'
 
 for exp in "${experiments[@]}"; do
   read dp tp tpsp fsdp <<< "$exp"
@@ -129,14 +147,22 @@ for exp in "${experiments[@]}"; do
 
   # MaxText FP8 baseline
   test=maxtext_fp8
-  run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
+  MAXTEXT_DIR=$NEW_MAXTEXT_DIR run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
     "bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --dtype=fp8 trace=$TRACE $BASE_ARGS"
 
   # TE variants
-  for recipe in "${TE_RECIPES[@]}"; do
-    test="te_fp8_${recipe}"
-    TE_ARGS_ALL="$TE_BASE_ARGS --te-fp8 true --te-recipe $recipe"
-    run_and_parse "$test" "$dp" "$tp" "$tpsp" "$fsdp" \
+  for quant in "${TE_RECIPES[@]}"; do
+    recipe_name=$(quantization_to_te_recipe $quant)
+    test="te_fp8_${recipe_name}"
+
+    # New integration
+    TE_ARGS_ALL="--quantization=$quant"
+    MAXTEXT_DIR=$NEW_MAXTEXT_DIR run_and_parse "new_$test" "$dp" "$tp" "$tpsp" "$fsdp" \
+      "bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --trace $TRACE $TE_ARGS_ALL $BASE_ARGS"
+
+    # Old integration
+    TE_ARGS_ALL="--te-dense true --te-mlp true --te-norm true --te-fp8 true --te-recipe $recipe_name"
+    MAXTEXT_DIR=$OLD_MAXTEXT_DIR run_and_parse "old_$test" "$dp" "$tp" "$tpsp" "$fsdp" \
       "bash ${SCRIPT_DIR}/test-maxtext-te.sh $args --trace $TRACE $TE_ARGS_ALL $BASE_ARGS"
   done
 done
