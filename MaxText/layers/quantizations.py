@@ -718,7 +718,7 @@ class TransformerEngineQuantization(Quantization):
       return 32
     return 1
 
-  def _wrap(self, f):
+  def _wrap(self, f, name = None):
     """ Wraps the given function `f` to support TransformerEngine quantization.
 
     This method does a couple things:
@@ -733,6 +733,7 @@ class TransformerEngineQuantization(Quantization):
 
     Args:
       f: The function to wrap. The first argument must be 'generate_quantizer_set'.
+      name: The name of this wrapped operation. If unspecified, will use `f.__name__`.
 
     Returns:
       A Flax linen module that wraps the given function.
@@ -760,6 +761,8 @@ class TransformerEngineQuantization(Quantization):
         with global_shard_guard(mesh_resource):
           return f(self.generate_quantizer_set, *args, **kwargs)
 
+    TEWrapper.__name__ = f'TEWrapper_{name if name else f.__name__}'
+
     return TEWrapper
 
   def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
@@ -778,7 +781,7 @@ class TransformerEngineQuantization(Quantization):
         quantizer_set=quantizer_set,
       )
 
-    return self._wrap(te_dot_general)
+    return self._wrap(te_dot_general, "dot_general")
 
   def einsum(self, dtype: DType = jnp.float32):
     """Placeholder for einsum implementation in subclasses."""
@@ -827,6 +830,6 @@ class TransformerEngineQuantization(Quantization):
         quantizer_sets=[generate_quantizer_set(postfix=name) for name in dense_layer_names],
       )
 
-    linen_layernorm_mlp = self._wrap(layernorm_mlp_fn)
+    linen_layernorm_mlp = self._wrap(layernorm_mlp_fn, "layernorm_mlp")
 
     return nnx_wrappers.ToNNX(linen_layernorm_mlp(), rngs=rngs)
