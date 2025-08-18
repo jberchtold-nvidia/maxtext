@@ -455,7 +455,17 @@ class MlpBlock(nnx.Module):
                           "activation_embed")
 
     if self.te_ln_mlp is not None:
-      return self.te_ln_mlp(inputs, dot_1_input_axes)
+      from transformer_engine.jax.sharding import global_shard_guard, MeshResource
+      # Inform TransformerEngine of MaxText's physical mesh resources.
+      mesh_resource = MeshResource(
+        dp_resource = "data",
+        tp_resource = "tensor",
+        fsdp_resource = "fsdp",
+        pp_resource = None,
+        cp_resource = "context",
+      )
+      with global_shard_guard(mesh_resource):
+        return self.te_ln_mlp(inputs, dot_1_input_axes)
 
     if self.mlp_layer_norm is not None:
       inputs = self.mlp_layer_norm(inputs)

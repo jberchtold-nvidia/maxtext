@@ -748,7 +748,17 @@ class AttentionOp(nnx.Module):
             """Decode not supported with flash attention.
                            Use `dot_product` instead."""
         )
-      return self.cudnn_flash_attention(query, key, value, decoder_segment_ids, model_mode), None, None
+      from transformer_engine.jax.sharding import global_shard_guard, MeshResource
+      # Inform TransformerEngine of MaxText's physical mesh resources.
+      mesh_resource = MeshResource(
+        dp_resource = "data",
+        tp_resource = "tensor",
+        fsdp_resource = "fsdp",
+        pp_resource = None,
+        cp_resource = "context",
+      )
+      with global_shard_guard(mesh_resource):
+        return self.cudnn_flash_attention(query, key, value, decoder_segment_ids, model_mode), None, None
     elif self.attention_kernel == "cudnn_flash_jax":
       if isinstance(key, KVTensor):
         key = key.dequant()
