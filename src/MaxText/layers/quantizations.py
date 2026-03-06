@@ -837,10 +837,11 @@ class TransformerEngineQuantization(Quantization):
 
     return self._wrap(te_dot_general, "dot_general")
 
-  def einsum(self, *args, **kwargs):
-    """Placeholder for einsum implementation in subclasses."""
-    import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
-    return te_flax.make_einsum_cls(quantization_recipe=self._recipe)
+  # Commented out for now until I write the small wrapper for einsum to call TE grouped GEMM.
+  # def einsum(self, *args, **kwargs):
+  #   """Placeholder for einsum implementation in subclasses."""
+  #   import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+  #   return te_flax.make_einsum_cls(quantization_recipe=self._recipe)
   
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments):
     """ Grouped GEMM """
@@ -849,7 +850,7 @@ class TransformerEngineQuantization(Quantization):
 
     def te_func(x, w, group_sizes, tiling):
       the_recipe = None # self._recipe
-      return te_flax.make_ragged_dot_cls(quantization_recipe=the_recipe)(
+      return te_flax.make_grouped_dense_cls(quantization_recipe=the_recipe)(
           x,
           w,
           group_sizes,
