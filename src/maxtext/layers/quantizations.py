@@ -957,10 +957,9 @@ class TransformerEngineQuantization(Quantization):
     class CachingTEDotGeneral(transformer_engine.jax.flax.module.TransformerEngineBase):
       """TEWrapper that caches quantized kernels across GA micro-steps.
 
-      ``has_variable`` checks whether the cache collection is in the input
-      variables.  This is a Python-level check resolved at trace time —
-      different input pytree structures produce different JIT traces.
-      All modules see the same structure within a single ``model.apply``.
+      Uses Python-level branching (two JIT traces): when the
+      ``quantized_kernel_cache`` collection is present in the input
+      variables the cached path is taken; otherwise the fresh path runs.
       """
 
       def generate_quantizer_set(self, postfix: str = ""):
@@ -1008,63 +1007,9 @@ class TransformerEngineQuantization(Quantization):
     # the_recipe = self._recipe
     # the_recipe = None
     the_recipe = TransformerEngineQuantization._get_recipe("te_mxfp8")
-
-    if not self._cache_quantized_weights:
-      return te_flax.make_grouped_dense_cls(quantization_recipe=the_recipe)(
-          inputs,
-          kernel,
-          group_sizes,
-      )
-
-    # --- Caching variant (same pattern as CachingTEDotGeneral above) ---
-    from transformer_engine.jax.quantize.cache import (  # pylint: disable=import-outside-toplevel
-        QW_CACHE_COLLECTION,
-        grouped_quantize_and_cache_kernel,
-        grouped_load_cached_kernel,
+    return te_flax.make_grouped_dense_cls(quantization_recipe=the_recipe)(
+        inputs,
+        kernel,
+        group_sizes,
     )
-    from transformer_engine.jax.dense import grouped_dense  # pylint: disable=import-outside-toplevel
-    import transformer_engine.jax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
-
-    fp8_recipe = the_recipe
-
-    class CachingTEGroupedDense(transformer_engine.jax.flax.module.TransformerEngineBase):
-      """Caching wrapper for grouped GEMM — same has_variable pattern."""
-
-      def generate_quantizer_set(self, postfix: str = "", n_groups: int = None):
-        OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
-        return super().generate_quantizer_set(
-            postfix=postfix,
-            variable_collection=OVERWRITE_WITH_GRADIENT,
-            quantization_checkpoint_name="quantization",
-            fp8_recipe=fp8_recipe,
-            n_groups=n_groups,
-        )
-
-      @nn.compact
-      def __call__(self, x, kernel, group_sizes, **kwargs):
-        del kwargs
-        num_groups = group_sizes.shape[0]
-        quantizer_set = self.generate_quantizer_set(n_groups=num_groups)
-        contracting_dims = ((1,), (1,))
-
-        has_cache = self.has_variable(QW_CACHE_COLLECTION, "leaf_0")
-        if has_cache:
-          quantizer_set = grouped_load_cached_kernel(
-              self, quantizer_set, kernel, group_sizes, contracting_dims,
-          )
-        else:
-          quantizer_set = grouped_quantize_and_cache_kernel(
-              self, quantizer_set, kernel, group_sizes, contracting_dims,
-          )
-
-        return grouped_dense(
-            x,
-            kernel,
-            group_sizes=group_sizes,
-            contracting_dims=contracting_dims,
-            quantizer_set=quantizer_set,
-        )
-
-    CachingTEGroupedDense.__name__ = "CachingTEWrapper_grouped_dense"
-    return CachingTEGroupedDense()(inputs, kernel, group_sizes)
 
