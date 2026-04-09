@@ -516,6 +516,14 @@ class RoutedMoE(nnx.Module):
     else:
       self.per_expert_scale = None
 
+    # Whether to use weight quantization caching for TE grouped GEMMs.
+    self._use_te_gmm_cache = (
+        quant is not None
+        and hasattr(quant, 'gmm_cls')
+        and self.config.te_use_gmm
+        and getattr(self.config, 'gradient_accumulation_steps', 1) > 1
+    )
+
   def _maybe_shard_with_logical(self, inputs, logical_name):
     return maybe_shard_with_logical(
         inputs,
@@ -1285,7 +1293,7 @@ class RoutedMoE(nnx.Module):
       gate_expert_bias = jnp.empty((0,), dtype=self.dtype)
 
     def gmm(
-        inputs, kernel, tiling, group_sizes, expert_assignments, weight_gather_axes, input_buffer_count, combine_scopes
+        inputs, kernel, tiling, group_sizes, expert_assignments, weight_gather_axes, input_buffer_count, combine_scopes,
     ):
       use_te_gmm = self.config.te_use_gmm
       if use_te_gmm:
@@ -1294,6 +1302,12 @@ class RoutedMoE(nnx.Module):
             # TODO(jberchtold): Adjust this based on TE GMM requirements per recipe
             TE_GMM_ALIGN_REQUIREMENT = 128
             assert self.config.te_router_and_permutation_impl and self.config.te_permutation_align_size % TE_GMM_ALIGN_REQUIREMENT == 0 and self.config.te_permutation_align_size > 0, f"TE GMM currently requires TE permutation with alignment (te_permutation_align_size > 0 and multiple of {TE_GMM_ALIGN_REQUIREMENT})."
+            if self._use_te_gmm_cache:
+              # Use CachingTEGroupedDense — the caching variant that stores
+              # quantized kernel leaves across GA micro-steps.  This runs
+              # inside shard_map (from sparse_matmul's wrapper), so
+              # tex.grouped_quantize works without a shardy_sharding_rule.
+              return self.quant.gmm_cls()()(inputs, kernel, group_sizes)
             return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
 
       # TODO (b/491979205) pipeline fsdp ag per repeat fails tokamax gmm

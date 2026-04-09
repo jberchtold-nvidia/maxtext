@@ -1000,16 +1000,78 @@ class TransformerEngineQuantization(Quantization):
     raise ValueError("Einsum is not yet supported for TransformerEngine quantization.")
 
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments):
-    """ Grouped GEMM """
+    """ Grouped GEMM (non-caching path) """
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
-    # Currently only BF16 is supported for TE GMM v2, so we don't use the quantization recipe here yet.
-    # the_recipe = self._recipe
-    # the_recipe = None
     the_recipe = TransformerEngineQuantization._get_recipe("te_mxfp8")
     return te_flax.make_grouped_dense_cls(quantization_recipe=the_recipe)(
         inputs,
         kernel,
         group_sizes,
     )
+
+  def gmm_cls(self):
+    """Returns a Flax linen module class for grouped GEMM with weight caching.
+
+    When ``gradient_accumulation_steps > 1``, returns a caching variant
+    that stores quantized expert kernels across micro-steps.  Otherwise
+    returns the standard (non-caching) grouped dense wrapper.
+    """
+    import transformer_engine.jax as te  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    from transformer_engine.common import recipe  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    from transformer_engine.jax.quantize.cache import (  # pylint: disable=import-outside-toplevel
+        QW_CACHE_COLLECTION,
+        grouped_quantize_and_cache_kernel,
+        grouped_load_cached_kernel,
+    )
+
+    fp8_recipe = TransformerEngineQuantization._get_recipe("te_mxfp8")
+
+    if not self._cache_quantized_weights:
+      # Return the standard (non-caching) grouped dense class.
+      return type(te_flax.make_grouped_dense_cls(quantization_recipe=fp8_recipe))
+
+    class CachingTEGroupedDense(te.flax.module.TransformerEngineBase):
+      """TEWrapper that caches quantized expert kernels across GA micro-steps.
+
+      ``tex.grouped_quantize`` (used on the fresh path) lacks a
+      ``shardy_sharding_rule``.  Callers MUST ensure this module is
+      invoked **inside** a ``shard_map`` that covers all EP / FSDP axes.
+      """
+
+      def generate_quantizer_set(self, postfix: str = "", n_groups: int = None):
+        OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
+        return super().generate_quantizer_set(
+            postfix=postfix,
+            variable_collection=OVERWRITE_WITH_GRADIENT,
+            quantization_checkpoint_name="quantization",
+            fp8_recipe=fp8_recipe,
+            n_groups=n_groups,
+        )
+
+      @nn.compact
+      def __call__(self, x, kernel, group_sizes, **kwargs):
+        del kwargs
+        num_groups = group_sizes.shape[0]
+        quantizer_set = self.generate_quantizer_set(n_groups=num_groups)
+
+        has_cache = self.has_variable(QW_CACHE_COLLECTION, "leaf_0")
+        if has_cache:
+          quantizer_set = grouped_load_cached_kernel(
+              self, quantizer_set, kernel,
+          )
+        else:
+          quantizer_set = grouped_quantize_and_cache_kernel(
+              self, quantizer_set, kernel,
+          )
+
+        return te.dense.grouped_dense(
+            x, kernel, group_sizes=group_sizes,
+            contracting_dims=((1,), (1,)),
+            quantizer_set=quantizer_set,
+        )
+
+    CachingTEGroupedDense.__name__ = "CachingTEWrapper_grouped_dense"
+    return CachingTEGroupedDense
 
