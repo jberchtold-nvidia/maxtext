@@ -21,6 +21,8 @@ from jax.sharding import NamedSharding
 from maxtext.common.common_types import ShardMode
 from maxtext.utils.sharding import maybe_shard_with_name
 
+_QW_CACHE_KEY = "quantized_kernel_cache"
+
 
 def gradient_accumulation_loss_and_grad(
     _loss_fn,
@@ -38,6 +40,11 @@ def gradient_accumulation_loss_and_grad(
   This function computes the gradient of `_loss_fn` over multiple microbatches
   and accumulates them before returning a single, averaged gradient. It uses
   `jax.lax.scan` for efficient accumulation on device.
+
+  When the model uses TE quantized-weight caching (CachingTEWrapper), the
+  first micro-step is run separately to quantize and populate the cache.
+  The remaining K-1 micro-steps reuse the cached quantized weights via
+  `jax.lax.scan`, producing a second JIT trace that skips quantization.
 
   It also supports a `shard_optimizer_over_data` mode (e.g., ZeRO-1) where
   parameters are cast to bf16 and sharded *before* the accumulation loop
@@ -87,18 +94,23 @@ def gradient_accumulation_loss_and_grad(
     ga_params = params
 
   ga_params = jax.tree.map(_maybe_shard_with_name, ga_params, ga_params_shardings)
-  grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
 
-  def accumulate_gradient(acc_grad_and_loss, data):
-    ga_params = acc_grad_and_loss["ga_params"]
-    (_, aux), cur_batch_gradient = grad_func(model, config, data, dropout_rng, ga_params, *extra_dpo_args, is_train=True)
-    acc_grad_and_loss["loss"] += aux["total_loss"]
-    acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]
-    acc_grad_and_loss["indexer_loss"] += aux["indexer_loss"]
-    acc_grad_and_loss["mtp_loss"] += aux["mtp_loss"]
-    acc_grad_and_loss["grad"] = jax.tree_util.tree_map(lambda x, y: x + y, cur_batch_gradient, acc_grad_and_loss["grad"])
-    acc_grad_and_loss["total_weights"] += aux["total_weights"]
-    return acc_grad_and_loss, aux
+  # Check if quantized-weight caching is active (CachingTEWrapper creates
+  # the quantized_kernel_cache collection during model.init).
+  _has_qw_cache = _QW_CACHE_KEY in ga_params
+
+  # --- Strip cache from the params used for differentiation ---------------
+  # The cache arrays must NOT be in the gradient pytree — the optimizer
+  # should never update them.  We keep a copy without the cache for
+  # grad_func (argnums=4), and merge the cache back in _loss_fn if needed.
+  if _has_qw_cache:
+    ga_cache = ga_params[_QW_CACHE_KEY]
+    ga_params_no_cache = {k: v for k, v in ga_params.items() if k != _QW_CACHE_KEY}
+  else:
+    ga_cache = None
+    ga_params_no_cache = ga_params
+
+  grad_func = jax.value_and_grad(_loss_fn, argnums=4, has_aux=True)
 
   def reshape_to_microbatch_accumulations(batch_arr):
     """Reshape global batch to microbatches, assuming batch axis is leading."""
@@ -108,21 +120,111 @@ def gradient_accumulation_loss_and_grad(
     return jnp.swapaxes(reshaped_batch_arr, 0, 1)
 
   data = jax.tree_util.tree_map(reshape_to_microbatch_accumulations, data)
-  init_grad = jax.tree_util.tree_map(jnp.zeros_like, ga_params)
-  init_grad = jax.tree.map(_maybe_shard_with_name, init_grad, grad_shardings)
-  init_grad_and_loss = {
-      "loss": 0.0,
-      "grad": init_grad,
-      "total_weights": 0,
-      "moe_lb_loss": 0.0,
-      "indexer_loss": 0.0,
-      "mtp_loss": 0.0,
-      "ga_params": ga_params,
-  }
 
-  grad_and_loss, aux = jax.lax.scan(
-      accumulate_gradient, init_grad_and_loss, data, length=config.gradient_accumulation_steps
-  )
+  # -----------------------------------------------------------------------
+  # Two-phase GA with quantized-weight caching
+  # -----------------------------------------------------------------------
+  if _has_qw_cache and config.gradient_accumulation_steps > 1:
+    # PHASE 1: First micro-step — quantize fresh, populate cache.
+    # ga_params_no_cache does NOT contain quantized_kernel_cache, so the
+    # CachingTEWrapper takes the "fresh" Python branch → JIT trace A.
+    first_data = jax.tree.map(lambda d: d[0], data)
+    (_, first_aux), first_grads = grad_func(
+        model, config, first_data, dropout_rng, ga_params_no_cache,
+        *extra_dpo_args, is_train=True,
+    )
+
+    # Extract the populated cache from the mutable output.
+    first_intermediates = first_aux.get("intermediate_outputs", {})
+    if isinstance(first_intermediates, tuple) and len(first_intermediates) > 1:
+      first_intermediates = first_intermediates[1]
+    populated_cache = first_intermediates.get(_QW_CACHE_KEY, ga_cache)
+
+    # PHASE 2: Remaining K-1 micro-steps — use cached quantized weights.
+    # ga_params_with_cache DOES contain quantized_kernel_cache, so the
+    # CachingTEWrapper takes the "cached" Python branch → JIT trace B.
+    ga_params_with_cache = {**ga_params_no_cache, _QW_CACHE_KEY: populated_cache}
+
+    remaining_data = jax.tree.map(lambda d: d[1:], data)
+
+    init_grad = jax.tree_util.tree_map(jnp.zeros_like, ga_params_with_cache)
+    init_grad_and_loss = {
+        "loss": first_aux["total_loss"],
+        "grad": jax.tree_util.tree_map(lambda fg, ig: fg + ig, first_grads, init_grad),
+        "total_weights": first_aux["total_weights"],
+        "moe_lb_loss": first_aux["moe_lb_loss"],
+        "indexer_loss": first_aux["indexer_loss"],
+        "mtp_loss": first_aux["mtp_loss"],
+        "ga_params": ga_params_with_cache,
+    }
+
+    def accumulate_cached(acc, micro_data):
+      """Scan body for cached micro-steps (no quantization)."""
+      p = acc["ga_params"]
+      # stop_gradient on cache so backward doesn't flow into cache arrays.
+      p = {
+          k: (jax.lax.stop_gradient(v) if k == _QW_CACHE_KEY else v)
+          for k, v in p.items()
+      }
+      (_, aux), cur_grads = grad_func(
+          model, config, micro_data, dropout_rng, p,
+          *extra_dpo_args, is_train=True,
+      )
+      acc["loss"] += aux["total_loss"]
+      acc["moe_lb_loss"] += aux["moe_lb_loss"]
+      acc["indexer_loss"] += aux["indexer_loss"]
+      acc["mtp_loss"] += aux["mtp_loss"]
+      acc["grad"] = jax.tree_util.tree_map(lambda x, y: x + y, cur_grads, acc["grad"])
+      acc["total_weights"] += aux["total_weights"]
+      return acc, aux
+
+    grad_and_loss, aux = jax.lax.scan(
+        accumulate_cached, init_grad_and_loss, remaining_data,
+        length=config.gradient_accumulation_steps - 1,
+    )
+
+    # Prepend first_aux so the stacked aux includes all micro-steps.
+    aux = jax.tree.map(
+        lambda first, rest: jnp.concatenate([first[None], rest], axis=0),
+        first_aux, aux,
+    )
+
+  else:
+    # ----- Standard GA (no caching) or single step -----------------------
+    def accumulate_gradient(acc_grad_and_loss, micro_data):
+      ga_params = acc_grad_and_loss["ga_params"]
+      (_, aux), cur_batch_gradient = grad_func(
+          model, config, micro_data, dropout_rng, ga_params,
+          *extra_dpo_args, is_train=True,
+      )
+      acc_grad_and_loss["loss"] += aux["total_loss"]
+      acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]
+      acc_grad_and_loss["indexer_loss"] += aux["indexer_loss"]
+      acc_grad_and_loss["mtp_loss"] += aux["mtp_loss"]
+      acc_grad_and_loss["grad"] = jax.tree_util.tree_map(
+          lambda x, y: x + y, cur_batch_gradient, acc_grad_and_loss["grad"]
+      )
+      acc_grad_and_loss["total_weights"] += aux["total_weights"]
+      return acc_grad_and_loss, aux
+
+    init_grad = jax.tree_util.tree_map(jnp.zeros_like, ga_params_no_cache)
+    init_grad = jax.tree.map(_maybe_shard_with_name, init_grad, grad_shardings)
+    init_grad_and_loss = {
+        "loss": 0.0,
+        "grad": init_grad,
+        "total_weights": 0,
+        "moe_lb_loss": 0.0,
+        "indexer_loss": 0.0,
+        "mtp_loss": 0.0,
+        "ga_params": ga_params_no_cache,
+    }
+
+    grad_and_loss, aux = jax.lax.scan(
+        accumulate_gradient, init_grad_and_loss, data,
+        length=config.gradient_accumulation_steps,
+    )
+
+  # --- Post-accumulation: normalize and return ----------------------------
   loss = (
       grad_and_loss["loss"] / grad_and_loss["total_weights"]
       + grad_and_loss["moe_lb_loss"] / config.gradient_accumulation_steps
@@ -130,6 +232,10 @@ def gradient_accumulation_loss_and_grad(
       + grad_and_loss["mtp_loss"] / config.gradient_accumulation_steps
   )
   raw_grads = grad_and_loss["grad"]
+  # Strip cache entries from gradients if present (cached path accumulates
+  # zero-gradient entries for the cache arrays due to stop_gradient).
+  if _QW_CACHE_KEY in raw_grads:
+    raw_grads = {k: v for k, v in raw_grads.items() if k != _QW_CACHE_KEY}
   raw_grads = jax.tree.map(_maybe_shard_with_name, raw_grads, params_shardings)
   raw_grads = jax.tree_util.tree_map(lambda arr: arr / grad_and_loss["total_weights"], raw_grads)
   aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), aux)  # pytype: disable=module-attr

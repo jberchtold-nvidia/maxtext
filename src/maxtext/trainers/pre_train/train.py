@@ -117,6 +117,12 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   if config.mtp_eval_target_module > 0 and not is_train:
     mutable_collections.append("mtp_acceptance")
 
+  # Quantized-weight caching for gradient accumulation: the CachingTEWrapper
+  # stores cached fp8 kernels in these collections so they can be reused
+  # across micro-steps.
+  if config.gradient_accumulation_steps > 1 and is_train:
+    mutable_collections.append("quantized_kernel_cache")
+
   if isinstance(model, nn.Module):
     # inputs, targets, segments, positions = apply_args
     rng1, aqt_rng = jax.random.split(dropout_rng)

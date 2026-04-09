@@ -836,6 +836,7 @@ class TransformerEngineQuantization(Quantization):
       raise ValueError(f"Invalid TransformerEngine quantization config: {config.quantization}")
 
     self._recipe = TransformerEngineQuantization._get_recipe(config.quantization)
+    self._cache_quantized_weights = getattr(config, "gradient_accumulation_steps", 1) > 1
 
   def __hash__(self):
     return hash((self.quant_mode, self._recipe))
@@ -926,22 +927,72 @@ class TransformerEngineQuantization(Quantization):
     return TEWrapper
 
   def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
-    """Placeholder for dot_general implementation in subclasses."""
+    """Returns dot_general, optionally with quantized-weight caching for GA."""
     import transformer_engine.jax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
-    def te_dot_general(generate_quantizer_set, x, kernel, dims, **kwargs):
-      contracting_dims, batch_dims = dims
-      assert batch_dims == ((), ()), "Batch dimensions must be empty for TransformerEngine dot."
+    if not self._cache_quantized_weights:
+      def te_dot_general(generate_quantizer_set, x, kernel, dims, **kwargs):
+        contracting_dims, batch_dims = dims
+        assert batch_dims == ((), ()), "Batch dimensions must be empty for TransformerEngine dot."
 
-      quantizer_set = generate_quantizer_set()
-      return transformer_engine.jax.dense.dense(
-          x,
-          kernel,
-          contracting_dims=contracting_dims,
-          quantizer_set=quantizer_set,
-      )
+        quantizer_set = generate_quantizer_set()
+        return transformer_engine.jax.dense.dense(
+            x,
+            kernel,
+            contracting_dims=contracting_dims,
+            quantizer_set=quantizer_set,
+        )
 
-    return self._wrap(te_dot_general, "dot_general")
+      return self._wrap(te_dot_general, "dot_general")
+
+    # --- Caching variant: reuse quantized kernels across GA micro-steps ---
+    from transformer_engine.jax.quantize.cache import (  # pylint: disable=import-outside-toplevel
+        QW_CACHE_COLLECTION,
+        quantize_and_cache_kernel,
+        load_cached_kernel,
+    )
+
+    fp8_recipe = self._recipe
+
+    class CachingTEDotGeneral(transformer_engine.jax.flax.module.TransformerEngineBase):
+      """TEWrapper that caches quantized kernels across GA micro-steps.
+
+      Uses Python-level branching (two JIT traces): when the
+      ``quantized_kernel_cache`` collection is present in the input
+      variables the cached path is taken; otherwise the fresh path runs.
+      """
+
+      def generate_quantizer_set(self, postfix: str = ""):
+        OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
+        return super().generate_quantizer_set(
+            postfix=postfix,
+            variable_collection=OVERWRITE_WITH_GRADIENT,
+            quantization_checkpoint_name="quantization",
+            fp8_recipe=fp8_recipe,
+        )
+
+      @nn.compact
+      def __call__(self, x, kernel, dims, **kwargs):
+        del kwargs
+        contracting_dims, batch_dims = dims
+        assert batch_dims == ((), ()), "Batch dimensions must be empty for TransformerEngine dot."
+        quantizer_set = self.generate_quantizer_set()
+
+        has_cache = self.has_variable(QW_CACHE_COLLECTION, "leaf_0")
+        if has_cache:
+          quantizer_set = load_cached_kernel(self, quantizer_set, kernel, contracting_dims)
+        else:
+          quantizer_set = quantize_and_cache_kernel(self, quantizer_set, kernel, contracting_dims)
+
+        return transformer_engine.jax.dense.dense(
+            x,
+            kernel,
+            contracting_dims=contracting_dims,
+            quantizer_set=quantizer_set,
+        )
+
+    CachingTEDotGeneral.__name__ = "CachingTEWrapper_dot_general"
+    return CachingTEDotGeneral
 
   def einsum(self, *args, **kwargs):
     """Placeholder for einsum implementation in subclasses."""
@@ -954,7 +1005,8 @@ class TransformerEngineQuantization(Quantization):
 
     # Currently only BF16 is supported for TE GMM v2, so we don't use the quantization recipe here yet.
     # the_recipe = self._recipe
-    the_recipe = None
+    # the_recipe = None
+    the_recipe = TransformerEngineQuantization._get_recipe("te_mxfp8")
     return te_flax.make_grouped_dense_cls(quantization_recipe=the_recipe)(
         inputs,
         kernel,
