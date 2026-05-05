@@ -105,6 +105,7 @@ class TEGroupedGemmQuantizationType(str, Enum):
     EMPTY = "" # Invalid when te_use_gmm is true, an explicit precision must be specified.
     TE_NO_QUANT = "te_no_quant" # Default precision, e.g. BF16, without quantization
     TE_MXFP8 = "te_mxfp8"
+    TE_NVFP4 = "te_nvfp4"
 
 class KvQuantAxis(str, Enum):
   """Axes to quantize over for the Key-Value cache."""

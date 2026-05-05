@@ -954,18 +954,33 @@ class TransformerEngineQuantization(Quantization):
     ALIGN_SIZES_BY_RECIPE_NAME = {
       "te_no_quant": 8, # BF16 alignment requirement for cuBLASLt kernel which is 16B or 8 BF16 elements
       "te_mxfp8": 128, # MXFP8BlockScaling requirement for TE grouped quant kernel and cuBLASLt MXFP8 grouped GEMM
+      # NVFP4 grouped GEMM uses the V2 path which (like MXFP8 V2) requires 128-aligned
+      # ragged dim and 128-aligned K/N.  The NVFP4 block size is 16, but the grouped
+      # GEMM setup kernel pads scales to (128, 4) so we still need 128 alignment.
+      "te_nvfp4": 128,
     }
     if te_gmm_quantization_recipe_name not in ALIGN_SIZES_BY_RECIPE_NAME:
       raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
-    return ALIGN_SIZES_BY_RECIPE_NAME[te_gmm_quantization_recipe_name] 
+    return ALIGN_SIZES_BY_RECIPE_NAME[te_gmm_quantization_recipe_name]
 
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments, te_gmm_quantization_recipe_name):
     """ Grouped GEMM """
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    from transformer_engine.common import recipe  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
-    # Currently only BF16 is supported for TE GMM v2, so we don't use the quantization recipe here yet.
     the_recipe = TransformerEngineQuantization._get_recipe(te_gmm_quantization_recipe_name)
-    # the_recipe = None
+    # NVFP4 grouped quantize today only supports 1D block scaling — neither the
+    # graph-safe RHT cast-fusion nor the host-aware nvte_group_nvfp4_quantize_with_amax
+    # implements 2D quantization (matches the PyTorch grouped quantize impl).  Force
+    # disable_2d_quantization=True so both operands quantize to NVFP4_1D_SCALING.
+    if isinstance(the_recipe, recipe.NVFP4BlockScaling) and not the_recipe.disable_2d_quantization:  # pytype: disable=module-attr
+      the_recipe = recipe.NVFP4BlockScaling(  # pytype: disable=module-attr
+          fp4_format=the_recipe.fp4_format,
+          fp8_format=the_recipe.fp8_format,
+          disable_rht=the_recipe.disable_rht,
+          disable_stochastic_rounding=the_recipe.disable_stochastic_rounding,
+          disable_2d_quantization=True,
+      )
     return te_flax.make_grouped_dense_cls(
       quantization_recipe=the_recipe,
       quantization_checkpoint_name="quantization",
