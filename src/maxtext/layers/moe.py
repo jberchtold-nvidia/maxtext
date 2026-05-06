@@ -18,6 +18,7 @@
 import enum
 import functools
 import math
+import os
 import random
 from typing import Iterable, Optional, Tuple, Union
 
@@ -2188,6 +2189,21 @@ class RoutedMoE(nnx.Module):
         COMBINE,
     ):
       return jnp.einsum
+
+    if isinstance(self.quant, quantizations.TransformerEngineQuantization):
+      # Dispatch / combine einsums aren't matmul-shaped; the TE grouped-GEMM
+      # path can't handle them. Keep them on plain jnp.einsum.
+      if einsum_name in (DISPATCH, COMBINE):
+        return jnp.einsum
+      # Override hook for benchmarking: when NVTE_FORCE_BF16_DENSE_MATMUL_EINSUM=1,
+      # bypass the TE batched_dense path for the wi_0 / wi_1 / wo einsums and use
+      # plain jnp.einsum (cuBLAS BF16 batched GEMM). Other layers (Dense projections
+      # etc.) are unaffected and continue to use TE quantization.
+      if os.environ.get("NVTE_FORCE_BF16_DENSE_MATMUL_EINSUM", "0") == "1":
+        return jnp.einsum
+      return self.quant.einsum(
+          te_gmm_quantization_recipe_name=self.config.te_gmm_quantization,
+      )
 
     if self.quant:
 

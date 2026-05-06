@@ -944,10 +944,42 @@ class TransformerEngineQuantization(Quantization):
 
     return self._wrap(te_dot_general, "dot_general")
 
-  def einsum(self, *args, **kwargs):
-    """Placeholder for einsum implementation in subclasses."""
-    # quant.einsum is only required for MoE or for inference with KVCache.
-    raise ValueError("Einsum is not yet supported for TransformerEngine quantization.")
+  def einsum(self, te_gmm_quantization_recipe_name: str = None, **kwargs):
+    """Returns a callable Flax module instance with a `jnp.einsum`-shaped interface
+    that routes batched-matmul einsums through TE grouped GEMM.
+
+    The returned object can be invoked as ``module(equation, lhs, rhs, **kwargs)``.
+    It only supports einsum equations with at least one shared batch dim between
+    lhs and rhs (such as the per-expert MoE FFN matmuls
+    ``"EBCM,EMH->EBCH"``); ``moe.get_einsum`` is responsible for routing
+    non-matmul einsums (dispatch / combine) to plain ``jnp.einsum``.
+    """
+    del kwargs  # Accepts but ignores `mesh_axes` etc. for compatibility with `aqt_einsum`.
+    import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    from transformer_engine.common import recipe  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+
+    if te_gmm_quantization_recipe_name is None:
+      raise ValueError(
+          "TransformerEngineQuantization.einsum() requires a"
+          " `te_gmm_quantization_recipe_name` (e.g. 'te_mxfp8') so the recipe used by"
+          " the underlying grouped GEMM can be selected."
+      )
+
+    the_recipe = TransformerEngineQuantization._get_recipe(te_gmm_quantization_recipe_name)
+    # Mirror the NVFP4 normalization in gmm() — NVFP4 grouped quantize today only
+    # supports 1D block scaling.
+    if isinstance(the_recipe, recipe.NVFP4BlockScaling) and not the_recipe.disable_2d_quantization:  # pytype: disable=module-attr
+      the_recipe = recipe.NVFP4BlockScaling(  # pytype: disable=module-attr
+          fp4_format=the_recipe.fp4_format,
+          fp8_format=the_recipe.fp8_format,
+          disable_rht=the_recipe.disable_rht,
+          disable_stochastic_rounding=the_recipe.disable_stochastic_rounding,
+          disable_2d_quantization=True,
+      )
+    return te_flax.make_grouped_einsum_cls(
+        quantization_recipe=the_recipe,
+        quantization_checkpoint_name="quantization",
+    )
 
   def get_gmm_align_size(self, te_gmm_quantization_recipe_name: str):
     """Get the alignment size for GMM based on the TransformerEngine quantization recipe."""
