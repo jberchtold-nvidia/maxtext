@@ -958,6 +958,7 @@ class TransformerEngineQuantization(Quantization):
       # ragged dim and 128-aligned K/N.  The NVFP4 block size is 16, but the grouped
       # GEMM setup kernel pads scales to (128, 4) so we still need 128 alignment.
       "te_nvfp4": 128,
+      "te_nvfp4_no_rht": 128,
     }
     if te_gmm_quantization_recipe_name not in ALIGN_SIZES_BY_RECIPE_NAME:
       raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
