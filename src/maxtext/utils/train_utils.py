@@ -250,6 +250,9 @@ def setup_train_loop(config, recorder, devices=None):
               eval_data_iterator,
           )
 
+    shaped_batch = maxtext_utils.get_shaped_batch(config)
+    max_utils.maybe_bootstrap_te_moe(config, mesh, shaped_batch)
+
     state, _, state_mesh_shardings, data_iterator = maxtext_utils.setup_training_state(
         data_iterator, config, mesh, checkpoint_manager, init_state_fn
     )

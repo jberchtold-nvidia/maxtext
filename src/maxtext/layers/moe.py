@@ -1862,8 +1862,9 @@ class RoutedMoE(nnx.Module):
             padding_headroom = int(self.num_experts * (align_size - 1))
             reverse_buffer_size = original_inputs_first_dim + padding_headroom
 
-          if sorted_selected_experts.shape[0] != original_inputs_first_dim:
-            raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
+          if (not perm_state.use_te
+              and perm_state.sorted_selected_experts.shape[0] != reverse_buffer_size):
+            raise ValueError("reverse_buffer_size does not match the permuted tensor" " shape!")
           output_shape = jax.lax.empty(
               (
                   reverse_buffer_size,
@@ -2540,17 +2541,127 @@ class RoutedMoE(nnx.Module):
     wo_kernel = max_utils.unbox_logicallypartioned(wo_kernel)
     return w0_kernel, w1_kernel, wo_kernel
 
+  def _te_moe_block(
+      self,
+      inputs: jax.Array,
+      gate_kernel: jax.Array,
+      w0_kernel: jax.Array,
+      w1_kernel: jax.Array,
+      wo_kernel: jax.Array,
+      w0_bias: jax.Array | None,
+      w1_bias: jax.Array | None,
+      wo_bias: jax.Array | None,
+      out_sharding: NamedSharding | None = None,
+  ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
+    """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params."""
+    try:
+      from transformer_engine.jax import moe as te_moe  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:
+      raise ImportError("te_moe_block=True requires TransformerEngine JAX MoE support.") from exc
+
+    if self.config.norm_topk_prob:
+      raise ValueError("te_moe_block=True does not currently support norm_topk_prob=True.")
+    if self.config.use_random_routing:
+      raise ValueError("te_moe_block=True does not support use_random_routing=True.")
+    if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
+      raise ValueError("te_moe_block=True does not currently support Llama4 routing semantics.")
+    if self.get_tensor_parallelism_size() > 1 or self.get_tensor_transpose_parallelism_size() > 1:
+      raise ValueError("te_moe_block=True currently requires tensor parallelism size 1.")
+    if not self.config.te_gmm_quantization:
+      raise ValueError("te_gmm_quantization must be specified when te_moe_block=True.")
+    if self.quant is None or not hasattr(self.quant, "get_gmm_quantizer_set"):
+      raise ValueError("te_moe_block=True requires TransformerEngine quantization.")
+
+    align_size = self.config.moe_permutation_group_align_size
+    if self.config.te_gmm_quantization == "te_mxfp8":
+      align_size = max(align_size, 128)
+
+    expert_bias = None
+    if self.config.routed_bias:
+      expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32)
+    ffn_quantizer_set = self.quant.get_gmm_quantizer_set(
+        self.config.te_gmm_quantization,
+        self.num_experts * self.mesh.shape.get("fsdp", 1),
+    )
+
+    output, lb_loss = te_moe.moe(
+        inputs,
+        gate_kernel,
+        w0_kernel,
+        w1_kernel,
+        wo_kernel,
+        w0_bias,
+        w1_bias,
+        wo_bias,
+        expert_bias,
+        ffn_quantizer_set,
+        num_experts=self.num_experts,
+        num_experts_per_tok=self.num_experts_per_tok,
+        activation_type=self.config.mlp_activations[0],
+        score_function=self.config.routed_score_func or "softmax",
+        use_pre_softmax=False,
+        num_groups=None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
+        group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
+        scaling_factor=self.config.routed_scaling_factor,
+        aux_loss_coeff=self.config.load_balance_loss_weight,
+        apply_topk_weights_early=False,
+        align_size=align_size,
+        ep_axis=self._expert_parallelism_name,
+        data_parallelism_axes=("fsdp",),
+        input_axes=("activation_batch", "activation_norm_length", None),
+        gate_kernel_axes=self.kernel_axes,
+        wi_kernel_axes=self.wi_kernel_axes,
+        wo_kernel_axes=self.wo_kernel_axes,
+        dtype=self.dtype,
+    )
+    output = output.astype(self.dtype)
+    if lb_loss is not None:
+      lb_loss = lb_loss.astype(self.dtype)
+    if out_sharding is not None:
+      output = jax.lax.with_sharding_constraint(output, out_sharding)
+    return output, lb_loss, None
+
   def __call__(
       self, inputs: jax.Array, gate_inputs: jax.Array | None = None, out_sharding: NamedSharding | None = None
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     cfg = self.config
     inputs = inputs.astype(cfg.dtype)
 
+    if cfg.te_moe_block and gate_inputs is not None:
+      raise ValueError("te_moe_block=True does not support separate gate_inputs.")
+    if cfg.te_moe_block and quantizations.in_serve_mode(self.quant):
+      raise ValueError("te_moe_block=True does not support serve-mode quantized weights.")
+
     gate_dtype = jnp.float32 if cfg.float32_gate_logits else cfg.dtype
     routing_inputs = inputs if gate_inputs is None else gate_inputs.astype(gate_dtype)
 
-    use_te = cfg.te_router_and_permutation_impl
-    if use_te:
+    if cfg.te_moe_block:
+      gate_kernel = jnp.asarray(self.gate.kernel[...], self.dtype)
+      w0_kernel = jnp.asarray(self.wi_0[...], self.dtype)
+      w1_kernel = jnp.asarray(self.wi_1[...], self.dtype)
+      wo_kernel = jnp.asarray(self.wo[...], self.dtype)
+      if self.per_expert_scale is not None:
+        wo_kernel = wo_kernel * jnp.asarray(self.per_expert_scale[...], self.dtype)[:, None, None]
+      if cfg.mlp_bias:
+        w0_bias = jnp.asarray(self.wi_0_bias[...], self.dtype)
+        w1_bias = jnp.asarray(self.wi_1_bias[...], self.dtype)
+        wo_bias = jnp.asarray(self.wo_bias[...], self.dtype)
+      else:
+        w0_bias, w1_bias, wo_bias = None, None, None
+      return self._te_moe_block(
+          inputs,
+          gate_kernel,
+          w0_kernel,
+          w1_kernel,
+          wo_kernel,
+          w0_bias,
+          w1_bias,
+          wo_bias,
+          out_sharding,
+      )
+
+    use_te_router = cfg.te_router_and_permutation_impl
+    if use_te_router:
       gate_logits, _ = self.gate(routing_inputs, return_raw_logits=True)
       pre_bias_logits = None
     else:
@@ -2784,4 +2895,3 @@ def get_routed_and_shared_moe(
       abstract_init=False,
   )
   return module
-

@@ -687,6 +687,10 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use TransformerEngine Grouped GEMM kernels for matmuls in MoE layers.",
   )
+  te_moe_block: bool = Field(
+      False,
+      description="Whether to use TransformerEngine's fused EP MoEBlock for routing, dispatch, grouped GEMM, and combine.",
+  )
   te_gmm_quantization: None | TEGroupedGemmQuantizationType = Field(
       TEGroupedGemmQuantizationType.EMPTY,
       description="Quantization mode for TE GMM matmuls, must be specified when te_use_gmm is true.",
@@ -2617,6 +2621,10 @@ class MaxTextConfig(
         raise ValueError("te_router_and_permutation_impl=True requires sparse_matmul=True.")
       if self.te_use_gmm and not self.sparse_matmul:
         raise ValueError("te_use_gmm=True requires sparse_matmul=True.")
+      if self.te_moe_block and not self.sparse_matmul:
+        raise ValueError("te_moe_block=True requires sparse_matmul=True.")
+      if self.te_moe_block and self.routed_bias_update_rate > 0.0:
+        raise ValueError("te_moe_block=True does not currently support routed_bias_update_rate > 0.")
       if self.te_use_gmm and self.te_gmm_quantization == TEGroupedGemmQuantizationType.EMPTY:
         raise ValueError("te_gmm_quantization must be specified when te_use_gmm is True.")
       self.validate_ragged_buffer_factor()

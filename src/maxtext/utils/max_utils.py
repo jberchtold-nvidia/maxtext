@@ -272,7 +272,16 @@ def maybe_initialize_jax_distributed_system(raw_keys):
   ] == "gpu_multiprocess":
     max_logging.log("Attempting to initialize the jax distributed system...")
     if not raw_keys["enable_emergency_checkpoint"]:
-      jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+      if os.environ.get("OMPI_COMM_WORLD_SIZE") is not None:
+        jax.distributed.initialize(
+            coordinator_address=os.environ.get("MAXTEXT_JAX_COORDINATOR_ADDRESS", "127.0.0.1:12355"),
+            num_processes=int(os.environ["OMPI_COMM_WORLD_SIZE"]),
+            process_id=int(os.environ["OMPI_COMM_WORLD_RANK"]),
+            local_device_ids=0,
+            initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+        )
+      else:
+        jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
     else:
       if raw_keys["hardware"] == "gpu_multiprocess":
         max_logging.log("Initializing jax distribtued to support local checkpointing with" " GPUs...")
@@ -1130,11 +1139,104 @@ def transformer_engine_context():
         fsdp_resource="fsdp",
         pp_resource=None,
         cp_resource="context",
+        ep_resource="expert",
     )
     with global_shard_guard(mesh_resource):
       yield
   except (ImportError, AttributeError):
     yield
+
+
+_te_moe_bootstrap_signature = None
+
+
+def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
+  """Eagerly initialize TransformerEngine NCCL EP for the fused MoEBlock path."""
+  if not getattr(config, "te_moe_block", False):
+    return
+
+  if jax.local_device_count() != 1:
+    raise ValueError(
+        "te_moe_block=True requires one local device per process. Run MaxText with "
+        "`test-maxtext.sh --multiprocess` or an equivalent one-GPU-per-process launcher."
+    )
+
+  try:
+    from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
+    from transformer_engine.jax.moe import (  # pylint: disable=import-outside-toplevel
+        record_ep_bootstrap_signature_for_moe,
+    )
+  except ImportError as exc:
+    raise ImportError(
+        "te_moe_block=True requires TransformerEngine with JAX EP MoE support."
+    ) from exc
+
+  ep_axis = "expert"
+  fsdp_axis = "fsdp"
+  ep_size = mesh.shape.get(ep_axis, 1)
+  fsdp_size = mesh.shape.get(fsdp_axis, 1)
+  if ep_size <= 1:
+    raise ValueError("te_moe_block=True requires ici_expert_parallelism > 1.")
+
+  batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  num_local_experts = config.num_experts // ep_size
+  if config.num_experts % ep_size != 0:
+    raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
+
+  natural_recv_pr = (batch_size // fsdp_size) * sequence_length * config.num_experts_per_tok
+  natural_slots_per_expert = (natural_recv_pr + num_local_experts - 1) // num_local_experts
+  effective_align = max(int(config.moe_permutation_group_align_size), 128)
+  slots_per_expert = (
+      (natural_slots_per_expert + effective_align - 1) // effective_align
+  ) * effective_align
+  recv_capacity_per_rank = num_local_experts * slots_per_expert
+  max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
+  hidden_dim = config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim
+
+  signature = (
+      jax.process_count(),
+      jax.process_index(),
+      ep_size,
+      config.num_experts,
+      max_tokens_per_rank,
+      recv_capacity_per_rank,
+      hidden_dim,
+  )
+  global _te_moe_bootstrap_signature
+  if _te_moe_bootstrap_signature == signature:
+    return
+  if _te_moe_bootstrap_signature is not None:
+    raise ValueError(
+        f"TE MoE EP was already bootstrapped with {_te_moe_bootstrap_signature}, "
+        f"but this run needs {signature}."
+    )
+
+  with jax.set_mesh(mesh), mesh:
+    max_logging.log(
+        "Bootstrapping TE MoE EP: "
+        f"world={jax.process_count()} rank={jax.process_index()} ep={ep_size} "
+        f"num_experts={config.num_experts} max_tokens_per_rank={max_tokens_per_rank} "
+        f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim}"
+    )
+    ep_bootstrap(
+        world_size=jax.process_count(),
+        rank=jax.process_index(),
+        ep_size=ep_size,
+        num_experts=config.num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
+        recv_capacity_per_rank=recv_capacity_per_rank,
+        hidden_dim=hidden_dim,
+        allow_handle_mem_reloc=True,
+        max_token_dtype=config.dtype,
+    )
+    record_ep_bootstrap_signature_for_moe(
+        num_experts=config.num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
+        recv_capacity_per_rank=recv_capacity_per_rank,
+        hidden_dim=hidden_dim,
+        ep_size=ep_size,
+    )
+  _te_moe_bootstrap_signature = signature
 
 
 def maybe_pad(inputs, tile_size):

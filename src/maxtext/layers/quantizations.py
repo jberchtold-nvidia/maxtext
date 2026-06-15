@@ -959,6 +959,23 @@ class TransformerEngineQuantization(Quantization):
       raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
     return ALIGN_SIZES_BY_RECIPE_NAME[te_gmm_quantization_recipe_name] 
 
+  def get_gmm_quantizer_set(self, te_gmm_quantization_recipe_name: str, n_groups: int):
+    """Create a TransformerEngine quantizer set for direct grouped GEMM calls."""
+    import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    from transformer_engine.jax.quantize import QuantizerFactory, ScalingMode  # pylint: disable=import-outside-toplevel
+
+    if te_gmm_quantization_recipe_name == "te_no_quant":
+      return QuantizerFactory.create_set(scaling_mode=ScalingMode.NO_SCALING, n_groups=n_groups)
+    if te_gmm_quantization_recipe_name != "te_mxfp8":
+      raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
+    return QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e4m3fn,
+        is_2x2x=True,
+        n_groups=n_groups,
+    )
+
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments, te_gmm_quantization_recipe_name):
     """ Grouped GEMM """
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
@@ -966,7 +983,11 @@ class TransformerEngineQuantization(Quantization):
     # Currently only BF16 is supported for TE GMM v2, so we don't use the quantization recipe here yet.
     the_recipe = TransformerEngineQuantization._get_recipe(te_gmm_quantization_recipe_name)
     # the_recipe = None
-    return te_flax.make_grouped_dense_cls(
+    original_input_ndim = inputs.ndim
+    if original_input_ndim == 2:
+      inputs = inputs.reshape(1, *inputs.shape)
+
+    output = te_flax.make_grouped_dense_cls(
       quantization_recipe=the_recipe,
       quantization_checkpoint_name="quantization",
     )(
@@ -974,4 +995,6 @@ class TransformerEngineQuantization(Quantization):
         kernel,
         group_sizes,
     )
-
+    if original_input_ndim == 2:
+      output = output.reshape(*output.shape[1:])
+    return output
