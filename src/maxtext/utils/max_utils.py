@@ -1175,8 +1175,6 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   fsdp_axis = "fsdp"
   ep_size = mesh.shape.get(ep_axis, 1)
   fsdp_size = mesh.shape.get(fsdp_axis, 1)
-  if ep_size <= 1:
-    raise ValueError("te_moe_block=True requires ici_expert_parallelism > 1.")
 
   batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
   num_local_experts = config.num_experts // ep_size
