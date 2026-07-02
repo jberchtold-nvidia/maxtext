@@ -2572,17 +2572,9 @@ class RoutedMoE(nnx.Module):
     if self.quant is None or not hasattr(self.quant, "get_gmm_quantizer_set"):
       raise ValueError("te_moe_block=True requires TransformerEngine quantization.")
 
-    align_size = self.config.moe_permutation_group_align_size
-    if self.config.te_gmm_quantization == "te_mxfp8":
-      align_size = max(align_size, 128)
-
     expert_bias = None
     if self.config.routed_bias:
       expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32)
-    ffn_quantizer_set = self.quant.get_gmm_quantizer_set(
-        self.config.te_gmm_quantization,
-        self.num_experts * self.mesh.shape.get("fsdp", 1),
-    )
 
     output, lb_loss = te_moe.moe(
         inputs,
@@ -2594,7 +2586,6 @@ class RoutedMoE(nnx.Module):
         w1_bias,
         wo_bias,
         expert_bias,
-        ffn_quantizer_set,
         num_experts=self.num_experts,
         num_experts_per_tok=self.num_experts_per_tok,
         activation_type=self.config.mlp_activations[0],
@@ -2605,7 +2596,6 @@ class RoutedMoE(nnx.Module):
         scaling_factor=self.config.routed_scaling_factor,
         aux_loss_coeff=self.config.load_balance_loss_weight,
         apply_topk_weights_early=False,
-        align_size=align_size,
         ep_axis=self._expert_parallelism_name,
         data_parallelism_axes=("fsdp",),
         input_axes=("activation_batch", "activation_norm_length", None),

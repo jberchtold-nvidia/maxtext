@@ -1133,7 +1133,7 @@ def transformer_engine_context():
     from transformer_engine.jax.sharding import global_shard_guard, MeshResource  # pylint: disable=import-outside-toplevel
     # Inform TransformerEngine of MaxText's physical mesh resources.
     mesh_resource = MeshResource(  # pytype: disable=wrong-arg-types
-        dp_resource="data",
+        dp_resource=None,
         tp_resource="tensor",
         # tpsp_resource = "tensor_sequence", #TODO(Phuong): add this back when upstreaming CGEMM
         fsdp_resource="fsdp",
@@ -1181,14 +1181,13 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   if config.num_experts % ep_size != 0:
     raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
 
-  natural_recv_pr = (batch_size // fsdp_size) * sequence_length * config.num_experts_per_tok
-  natural_slots_per_expert = (natural_recv_pr + num_local_experts - 1) // num_local_experts
   effective_align = max(int(config.moe_permutation_group_align_size), 128)
+  max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
+  natural_slots_per_expert = ep_size * max_tokens_per_rank
   slots_per_expert = (
       (natural_slots_per_expert + effective_align - 1) // effective_align
   ) * effective_align
   recv_capacity_per_rank = num_local_experts * slots_per_expert
-  max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
   hidden_dim = config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim
 
   signature = (
@@ -1219,12 +1218,10 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
     ep_bootstrap(
         world_size=jax.process_count(),
         rank=jax.process_index(),
-        ep_size=ep_size,
         num_experts=config.num_experts,
         max_tokens_per_rank=max_tokens_per_rank,
         recv_capacity_per_rank=recv_capacity_per_rank,
         hidden_dim=hidden_dim,
-        allow_handle_mem_reloc=True,
         max_token_dtype=config.dtype,
     )
     record_ep_bootstrap_signature_for_moe(
