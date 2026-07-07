@@ -976,6 +976,50 @@ class TransformerEngineQuantization(Quantization):
         n_groups=n_groups,
     )
 
+  def get_moe_block_quantizer_set(
+      self,
+      te_gmm_quantization_recipe_name: str,
+      n_token_groups: int,
+      n_expert_groups: int,
+  ):
+    """Create a TransformerEngine quantizer set for TE MoEBlock grouped GEMMs."""
+    import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    from transformer_engine.jax.quantize import (  # pylint: disable=import-outside-toplevel
+        QuantizerFactory,
+        QuantizerSet,
+        ScalingMode,
+    )
+
+    if te_gmm_quantization_recipe_name == "te_no_quant":
+      return QuantizerFactory.create_set(scaling_mode=ScalingMode.NO_SCALING, is_2x2x=False)
+    if te_gmm_quantization_recipe_name != "te_mxfp8":
+      raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
+    if n_token_groups <= 0 or n_expert_groups <= 0:
+      raise ValueError(
+          "TE MoEBlock quantizer group counts must be positive, got "
+          f"n_token_groups={n_token_groups}, n_expert_groups={n_expert_groups}."
+      )
+
+    token_quantizer_set = QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e4m3fn,
+        is_2x2x=True,
+        n_groups=n_token_groups,
+    )
+    expert_quantizer_set = QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e4m3fn,
+        is_2x2x=True,
+        n_groups=n_expert_groups,
+    )
+    return QuantizerSet(
+        x=token_quantizer_set.x,
+        kernel=expert_quantizer_set.kernel,
+        dgrad=token_quantizer_set.dgrad,
+    )
+
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments, te_gmm_quantization_recipe_name):
     """ Grouped GEMM """
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error

@@ -20,6 +20,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import jax.numpy as jnp
+import pytest
 
 
 _QUANTIZATIONS_PATH = Path(__file__).parents[2] / "src" / "maxtext" / "layers" / "quantizations.py"
@@ -71,3 +72,20 @@ def test_te_gmm_adapter_local_ep_axis(monkeypatch):
   ep_local_output = quant.gmm(ep_local_inputs, kernel, None, group_sizes, None, "te_mxfp8")
   assert seen_input_shapes[-1] == (1, 128, 16)
   assert ep_local_output.shape == (1, 128, 32)
+
+
+def test_moe_block_quantizer_set_uses_inferred_group_counts():
+  quant = quantizations.TransformerEngineQuantization(SimpleNamespace(quantization="te_mxfp8"))
+  quantizer_set = quant.get_moe_block_quantizer_set(
+      "te_mxfp8", n_token_groups=64, n_expert_groups=32
+  )
+
+  assert len(quantizer_set.x.quantizers) == 64
+  assert len(quantizer_set.dgrad.quantizers) == 64
+  assert len(quantizer_set.kernel.quantizers) == 32
+
+
+def test_moe_block_quantizer_set_rejects_invalid_group_counts():
+  quant = quantizations.TransformerEngineQuantization(SimpleNamespace(quantization="te_mxfp8"))
+  with pytest.raises(ValueError, match="group counts must be positive"):
+    quant.get_moe_block_quantizer_set("te_mxfp8", n_token_groups=0, n_expert_groups=32)

@@ -2569,12 +2569,19 @@ class RoutedMoE(nnx.Module):
       raise ValueError("te_moe_block=True currently requires tensor parallelism size 1.")
     if not self.config.te_gmm_quantization:
       raise ValueError("te_gmm_quantization must be specified when te_moe_block=True.")
-    if self.quant is None or not hasattr(self.quant, "get_gmm_quantizer_set"):
+    if self.quant is None or not hasattr(self.quant, "get_moe_block_quantizer_set"):
       raise ValueError("te_moe_block=True requires TransformerEngine quantization.")
 
     expert_bias = None
     if self.config.routed_bias:
       expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32)
+
+    fsdp_size = self.mesh.shape.get("fsdp", 1)
+    quantizer_set = self.quant.get_moe_block_quantizer_set(
+        self.config.te_gmm_quantization,
+        n_token_groups=self.num_experts * fsdp_size,
+        n_expert_groups=self.num_experts,
+    )
 
     output, lb_loss = te_moe.moe(
         inputs,
@@ -2603,6 +2610,7 @@ class RoutedMoE(nnx.Module):
         wi_kernel_axes=self.wi_kernel_axes,
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
+        quantizer_set=quantizer_set,
     )
     output = output.astype(self.dtype)
     if lb_loss is not None:
