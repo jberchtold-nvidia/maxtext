@@ -2577,6 +2577,12 @@ class RoutedMoE(nnx.Module):
       expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32)
 
     fsdp_size = self.mesh.shape.get("fsdp", 1)
+    self.quant.validate_moe_block_quantization_shapes(
+        self.config.te_gmm_quantization,
+        hidden_dim=inputs.shape[-1],
+        intermediate_dim=w0_kernel.shape[-1],
+        fsdp_size=fsdp_size,
+    )
     quantizer_set = self.quant.get_moe_block_quantizer_set(
         self.config.te_gmm_quantization,
         n_token_groups=self.num_experts * fsdp_size,

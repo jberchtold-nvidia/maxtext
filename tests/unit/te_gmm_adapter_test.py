@@ -89,3 +89,17 @@ def test_moe_block_quantizer_set_rejects_invalid_group_counts():
   quant = quantizations.TransformerEngineQuantization(SimpleNamespace(quantization="te_mxfp8"))
   with pytest.raises(ValueError, match="group counts must be positive"):
     quant.get_moe_block_quantizer_set("te_mxfp8", n_token_groups=0, n_expert_groups=32)
+
+
+def test_moe_block_mxfp8_shape_validation_uses_local_hidden_dim():
+  quant = quantizations.TransformerEngineQuantization(SimpleNamespace(quantization="te_mxfp8"))
+
+  quant.validate_moe_block_quantization_shapes("te_mxfp8", hidden_dim=1792, intermediate_dim=2048, fsdp_size=2)
+  quant.validate_moe_block_quantization_shapes("te_no_quant", hidden_dim=1793, intermediate_dim=2049, fsdp_size=2)
+
+  with pytest.raises(ValueError, match="local hidden.*128-aligned"):
+    quant.validate_moe_block_quantization_shapes("te_mxfp8", hidden_dim=1800, intermediate_dim=2048, fsdp_size=2)
+  with pytest.raises(ValueError, match="intermediate.*128-aligned"):
+    quant.validate_moe_block_quantization_shapes("te_mxfp8", hidden_dim=1792, intermediate_dim=2050, fsdp_size=2)
+  with pytest.raises(ValueError, match="must be divisible by fsdp_size"):
+    quant.validate_moe_block_quantization_shapes("te_mxfp8", hidden_dim=1793, intermediate_dim=2048, fsdp_size=2)

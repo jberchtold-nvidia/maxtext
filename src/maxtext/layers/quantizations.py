@@ -1020,6 +1020,32 @@ class TransformerEngineQuantization(Quantization):
         dgrad=token_quantizer_set.dgrad,
     )
 
+  def validate_moe_block_quantization_shapes(
+      self,
+      te_gmm_quantization_recipe_name: str,
+      hidden_dim: int,
+      intermediate_dim: int,
+      fsdp_size: int,
+  ) -> None:
+    """Validate per-rank TE MoEBlock grouped-quantization dimensions."""
+    if te_gmm_quantization_recipe_name != "te_mxfp8":
+      return
+    if fsdp_size <= 0 or hidden_dim % fsdp_size != 0:
+      raise ValueError(f"MoE hidden_dim={hidden_dim} must be divisible by fsdp_size={fsdp_size} for TE MXFP8.")
+
+    alignment = self.get_gmm_align_size(te_gmm_quantization_recipe_name)
+    local_hidden_dim = hidden_dim // fsdp_size
+    for name, size in (
+        ("local hidden", local_hidden_dim),
+        ("intermediate", intermediate_dim),
+    ):
+      if size % alignment != 0:
+        raise ValueError(
+            f"TE MoEBlock MXFP8 requires the {name} dimension to be {alignment}-aligned, "
+            f"got {size} (hidden_dim={hidden_dim}, fsdp_size={fsdp_size}, "
+            f"intermediate_dim={intermediate_dim})."
+        )
+
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments, te_gmm_quantization_recipe_name):
     """ Grouped GEMM """
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
