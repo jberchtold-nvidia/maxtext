@@ -344,5 +344,31 @@ class TestMaybePad(unittest.TestCase):
     self.assertEqual(padding_amount, target_padding_amount)
 
 
+class TestTeMoeRecvCapacity(unittest.TestCase):
+  """Tests TE MoE bootstrap receive-capacity sizing."""
+
+  def test_production_shape_uses_topk_assignment_bound(self):
+    recv_capacity = max_utils._te_moe_recv_capacity_per_rank(
+        ep_size=2,
+        max_tokens_per_rank=12288,
+        num_experts_per_tok=8,
+        num_local_experts=16,
+        alignment=128,
+    )
+
+    self.assertEqual(recv_capacity, 196608)
+
+  def test_rounds_each_expert_to_alignment(self):
+    recv_capacity = max_utils._te_moe_recv_capacity_per_rank(
+        ep_size=2,
+        max_tokens_per_rank=65,
+        num_experts_per_tok=2,
+        num_local_experts=4,
+        alignment=128,
+    )
+
+    self.assertEqual(recv_capacity, 512)
+
+
 if __name__ == "__main__":
   unittest.main()

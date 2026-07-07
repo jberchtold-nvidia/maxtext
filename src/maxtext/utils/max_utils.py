@@ -1150,6 +1150,14 @@ def transformer_engine_context():
 _te_moe_bootstrap_signature = None
 
 
+def _te_moe_recv_capacity_per_rank(ep_size, max_tokens_per_rank, num_experts_per_tok, num_local_experts, alignment):
+  """Calculate the aligned per-rank receive capacity for TE MoE dispatch."""
+  natural_recv_capacity = ep_size * max_tokens_per_rank * num_experts_per_tok
+  natural_slots_per_expert = (natural_recv_capacity + num_local_experts - 1) // num_local_experts
+  slots_per_expert = ((natural_slots_per_expert + alignment - 1) // alignment) * alignment
+  return num_local_experts * slots_per_expert
+
+
 def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   """Eagerly initialize TransformerEngine NCCL EP for the fused MoEBlock path."""
   if not getattr(config, "te_moe_block", False):
@@ -1183,11 +1191,13 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
 
   effective_align = max(int(config.moe_permutation_group_align_size), 128)
   max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
-  natural_slots_per_expert = ep_size * max_tokens_per_rank
-  slots_per_expert = (
-      (natural_slots_per_expert + effective_align - 1) // effective_align
-  ) * effective_align
-  recv_capacity_per_rank = num_local_experts * slots_per_expert
+  recv_capacity_per_rank = _te_moe_recv_capacity_per_rank(
+      ep_size,
+      max_tokens_per_rank,
+      config.num_experts_per_tok,
+      num_local_experts,
+      effective_align,
+  )
   hidden_dim = config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim
 
   signature = (
