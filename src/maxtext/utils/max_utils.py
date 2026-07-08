@@ -1151,11 +1151,18 @@ _te_moe_bootstrap_signature = None
 
 
 def _te_moe_recv_capacity_per_rank(ep_size, max_tokens_per_rank, num_experts_per_tok, num_local_experts, alignment):
-  """Calculate the aligned per-rank receive capacity for TE MoE dispatch."""
-  natural_recv_capacity = ep_size * max_tokens_per_rank * num_experts_per_tok
-  natural_slots_per_expert = (natural_recv_capacity + num_local_experts - 1) // num_local_experts
-  slots_per_expert = ((natural_slots_per_expert + alignment - 1) // alignment) * alignment
-  return num_local_experts * slots_per_expert
+  """Mirror TE MoE's worst-case aligned receive-capacity bound."""
+  tokens_per_ep_group = ep_size * max_tokens_per_rank
+  max_local_assignments = tokens_per_ep_group * min(num_experts_per_tok, num_local_experts)
+  max_nonempty_experts = min(num_local_experts, max_local_assignments)
+  padded_total_bound = max_local_assignments + (alignment - 1) * max_nonempty_experts
+  aligned_total_bound = ((padded_total_bound + alignment - 1) // alignment) * alignment
+  per_expert_bound = (
+      num_local_experts
+      * ((tokens_per_ep_group + alignment - 1) // alignment)
+      * alignment
+  )
+  return min(per_expert_bound, aligned_total_bound)
 
 
 def maybe_bootstrap_te_moe(config, mesh, shaped_batch):

@@ -1020,6 +1020,22 @@ class TransformerEngineQuantization(Quantization):
         dgrad=token_quantizer_set.dgrad,
     )
 
+  def get_moe_block_quantizer_sets(
+      self,
+      te_gmm_quantization_recipe_name: str,
+      n_token_groups: int,
+      n_expert_groups: int,
+  ):
+    """Create independent FC1 and FC2 quantizer sets for TE MoEBlock."""
+    return tuple(
+        self.get_moe_block_quantizer_set(
+            te_gmm_quantization_recipe_name,
+            n_token_groups=n_token_groups,
+            n_expert_groups=n_expert_groups,
+        )
+        for _ in range(2)
+    )
+
   def validate_moe_block_quantization_shapes(
       self,
       te_gmm_quantization_recipe_name: str,

@@ -2569,7 +2569,7 @@ class RoutedMoE(nnx.Module):
       raise ValueError("te_moe_block=True currently requires tensor parallelism size 1.")
     if not self.config.te_gmm_quantization:
       raise ValueError("te_gmm_quantization must be specified when te_moe_block=True.")
-    if self.quant is None or not hasattr(self.quant, "get_moe_block_quantizer_set"):
+    if self.quant is None or not hasattr(self.quant, "get_moe_block_quantizer_sets"):
       raise ValueError("te_moe_block=True requires TransformerEngine quantization.")
 
     expert_bias = None
@@ -2577,16 +2577,24 @@ class RoutedMoE(nnx.Module):
       expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32)
 
     fsdp_size = self.mesh.shape.get("fsdp", 1)
+    ep_size = self.mesh.shape.get(self._expert_parallelism_name, 1)
+    if self.num_experts % ep_size != 0:
+      raise ValueError(
+          f"num_experts={self.num_experts} must be divisible by EP size={ep_size}."
+      )
+    num_local_experts = self.num_experts // ep_size
     self.quant.validate_moe_block_quantization_shapes(
         self.config.te_gmm_quantization,
         hidden_dim=inputs.shape[-1],
         intermediate_dim=w0_kernel.shape[-1],
         fsdp_size=fsdp_size,
     )
-    quantizer_set = self.quant.get_moe_block_quantizer_set(
+    fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
         self.config.te_gmm_quantization,
-        n_token_groups=self.num_experts * fsdp_size,
-        n_expert_groups=self.num_experts,
+        # Teddy's MoEBlock runs grouped quantize/GEMM inside shard_map,
+        # where both token group_sizes and expert kernels are shard-local.
+        n_token_groups=num_local_experts,
+        n_expert_groups=num_local_experts,
     )
 
     output, lb_loss = te_moe.moe(
@@ -2616,7 +2624,8 @@ class RoutedMoE(nnx.Module):
         wi_kernel_axes=self.wi_kernel_axes,
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
-        quantizer_set=quantizer_set,
+        fc1_quantizer_set=fc1_quantizer_set,
+        fc2_quantizer_set=fc2_quantizer_set,
     )
     output = output.astype(self.dtype)
     if lb_loss is not None:
