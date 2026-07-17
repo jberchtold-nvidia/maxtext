@@ -405,9 +405,11 @@ class RoutedMoE(nnx.Module):
     )
 
     if self.config.shard_exp_on_fsdp:
-      # special sharding for dsv3
-      self.wi_kernel_axes = ("embed_moe", None, "mlp_moe")
-      self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
+      # Shard the expert dimension across both FSDP and EP. This avoids
+      # replicating FSDP-owned expert shards across the expert mesh axis.
+      expert_fsdp_axes = ("fsdp", "expert")
+      self.wi_kernel_axes = (expert_fsdp_axes, None, "mlp_moe")
+      self.wo_kernel_axes = (expert_fsdp_axes, "mlp_moe", None)
     elif self.config.use_2d_fsdp_sharding:
       self.wi_kernel_axes = ("embed_moe", "mlp_moe", None)
       self.wo_kernel_axes = ("embed_moe", "mlp_moe", None)
@@ -2590,11 +2592,11 @@ class RoutedMoE(nnx.Module):
     )
     fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
         self.config.te_gmm_quantization,
-        # TE flattens dispatch buffers and DP-broadcast expert weights in
-        # (fsdp, ep, local_expert) order. Both operands therefore have one
-        # global quantizer group per FSDP replica and global expert.
+        # Dispatch buffers have one group per (fsdp, ep, local_expert),
+        # while model weights retain their global expert-group shape until
+        # TE's grouped-GEMM partitioning gathers the quantized FSDP shard.
         n_token_groups=fsdp_size * self.num_experts,
-        n_expert_groups=fsdp_size * self.num_experts,
+        n_expert_groups=self.num_experts,
     )
 
     output, lb_loss = te_moe.moe(
