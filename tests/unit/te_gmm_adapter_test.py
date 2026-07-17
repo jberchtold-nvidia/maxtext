@@ -85,6 +85,19 @@ def test_moe_block_quantizer_set_uses_inferred_group_counts():
   assert len(quantizer_set.kernel.quantizers) == 32
 
 
+def test_moe_block_quantizer_sets_are_independent():
+  quant = quantizations.TransformerEngineQuantization(SimpleNamespace(quantization="te_mxfp8"))
+  fc1_quantizer_set, fc2_quantizer_set = quant.get_moe_block_quantizer_sets(
+      "te_mxfp8", n_token_groups=64, n_expert_groups=64
+  )
+
+  assert fc1_quantizer_set is not fc2_quantizer_set
+  for quantizer_set in (fc1_quantizer_set, fc2_quantizer_set):
+    assert len(quantizer_set.x.quantizers) == 64
+    assert len(quantizer_set.dgrad.quantizers) == 64
+    assert len(quantizer_set.kernel.quantizers) == 64
+
+
 def test_moe_block_quantizer_set_rejects_invalid_group_counts():
   quant = quantizations.TransformerEngineQuantization(SimpleNamespace(quantization="te_mxfp8"))
   with pytest.raises(ValueError, match="group counts must be positive"):

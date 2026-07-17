@@ -2569,13 +2569,8 @@ class RoutedMoE(nnx.Module):
       raise ValueError("te_moe_block=True currently requires tensor parallelism size 1.")
     if not self.config.te_gmm_quantization:
       raise ValueError("te_gmm_quantization must be specified when te_moe_block=True.")
-    if self.quant is None or not hasattr(self.quant, "validate_moe_block_quantization_shapes"):
+    if self.quant is None or not hasattr(self.quant, "get_moe_block_quantizer_sets"):
       raise ValueError("te_moe_block=True requires TransformerEngine quantization.")
-    if self.config.te_gmm_quantization != "te_no_quant":
-      raise ValueError(
-          "The global-view TransformerEngine MoEBlock currently supports only "
-          "te_gmm_quantization=te_no_quant."
-      )
 
     expert_bias = None
     if self.config.routed_bias:
@@ -2592,6 +2587,14 @@ class RoutedMoE(nnx.Module):
         hidden_dim=inputs.shape[-1],
         intermediate_dim=w0_kernel.shape[-1],
         fsdp_size=fsdp_size,
+    )
+    fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
+        self.config.te_gmm_quantization,
+        # TE flattens dispatch buffers and DP-broadcast expert weights in
+        # (fsdp, ep, local_expert) order. Both operands therefore have one
+        # global quantizer group per FSDP replica and global expert.
+        n_token_groups=fsdp_size * self.num_experts,
+        n_expert_groups=fsdp_size * self.num_experts,
     )
 
     output, lb_loss = te_moe.moe(
@@ -2614,6 +2617,7 @@ class RoutedMoE(nnx.Module):
         scaling_factor=self.config.routed_scaling_factor,
         aux_loss_coeff=self.config.load_balance_loss_weight,
         apply_topk_weights_early=False,
+        quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
         ep_axis=self._expert_parallelism_name,
         data_parallelism_axes=("fsdp",),
         input_axes=("activation_batch", "activation_norm_length", None),

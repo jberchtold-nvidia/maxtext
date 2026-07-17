@@ -1026,7 +1026,7 @@ class TransformerEngineQuantization(Quantization):
       n_token_groups: int,
       n_expert_groups: int,
   ):
-    """Create independent FC1 and FC2 quantizer sets for TE MoEBlock."""
+    """Create independent FC1 and FC2 quantizer sets for TE's MoE custom VJP."""
     return tuple(
         self.get_moe_block_quantizer_set(
             te_gmm_quantization_recipe_name,
