@@ -2618,7 +2618,7 @@ class RoutedMoE(nnx.Module):
         group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
         scaling_factor=self.config.routed_scaling_factor,
         aux_loss_coeff=self.config.load_balance_loss_weight,
-        apply_topk_weights_early=False,
+        apply_topk_weights_early=True,
         quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
         ep_axis=self._expert_parallelism_name,
         data_parallelism_axes=("fsdp",),
