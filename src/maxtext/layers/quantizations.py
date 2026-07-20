@@ -1042,17 +1042,25 @@ class TransformerEngineQuantization(Quantization):
       hidden_dim: int,
       intermediate_dim: int,
       fsdp_size: int,
+      shard_exp_on_fsdp: bool = False,
   ) -> None:
-    """Validate per-rank TE MoEBlock grouped-quantization dimensions."""
+    """Validate the local TE MoEBlock grouped-quantization dimensions.
+
+    When FSDP shards experts, the grouped-GEMM K dimension remains the full
+    hidden dimension. Otherwise FSDP shards that K dimension directly.
+    """
     if te_gmm_quantization_recipe_name != "te_mxfp8":
       return
-    if fsdp_size <= 0 or hidden_dim % fsdp_size != 0:
+    if fsdp_size <= 0:
+      raise ValueError(f"MoE fsdp_size must be positive, got {fsdp_size}.")
+    if not shard_exp_on_fsdp and hidden_dim % fsdp_size != 0:
       raise ValueError(f"MoE hidden_dim={hidden_dim} must be divisible by fsdp_size={fsdp_size} for TE MXFP8.")
 
     alignment = self.get_gmm_align_size(te_gmm_quantization_recipe_name)
-    local_hidden_dim = hidden_dim // fsdp_size
+    local_hidden_dim = hidden_dim if shard_exp_on_fsdp else hidden_dim // fsdp_size
+    hidden_dim_name = "hidden/K (FSDP shards experts)" if shard_exp_on_fsdp else "local hidden/K (FSDP shards hidden)"
     for name, size in (
-        ("local hidden", local_hidden_dim),
+        (hidden_dim_name, local_hidden_dim),
         ("intermediate", intermediate_dim),
     ):
       if size % alignment != 0:

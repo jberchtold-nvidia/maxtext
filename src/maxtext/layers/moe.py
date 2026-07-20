@@ -2589,6 +2589,7 @@ class RoutedMoE(nnx.Module):
         hidden_dim=inputs.shape[-1],
         intermediate_dim=w0_kernel.shape[-1],
         fsdp_size=fsdp_size,
+        shard_exp_on_fsdp=self.config.shard_exp_on_fsdp,
     )
     fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
         self.config.te_gmm_quantization,
