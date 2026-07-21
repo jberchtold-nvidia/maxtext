@@ -459,28 +459,41 @@ class RoutedMoE(nnx.Module):
       # collection.
       self.wi_0 = jnp.zeros((num_experts, self.moe_expert_input_dim, intermediate_dim))
       self.wi_1 = jnp.zeros((num_experts, self.moe_expert_input_dim, intermediate_dim))
+      self.wi = jnp.zeros((num_experts, self.moe_expert_input_dim, 2 * intermediate_dim))
       self.wo = jnp.zeros((num_experts, intermediate_dim, self.moe_expert_input_dim))
     else:
-      self.wi_0 = nnx.Param(
-          self.kernel_init(
-              self.rngs.params(),
-              (num_experts, self.moe_expert_input_dim, intermediate_dim),
-              weight_dtype,
-              kernel_in_axis,
-              kernel_out_axis,
-          ),
-          sharding=self.wi_kernel_axes,
-      )
-      self.wi_1 = nnx.Param(
-          self.kernel_init(
-              self.rngs.params(),
-              (num_experts, self.moe_expert_input_dim, intermediate_dim),
-              weight_dtype,
-              kernel_in_axis,
-              kernel_out_axis,
-          ),
-          sharding=self.wi_kernel_axes,
-      )
+      if self.config.te_moe_block:
+        self.wi = nnx.Param(
+            self.kernel_init(
+                self.rngs.params(),
+                (num_experts, self.moe_expert_input_dim, 2 * intermediate_dim),
+                weight_dtype,
+                kernel_in_axis,
+                kernel_out_axis,
+            ),
+            sharding=self.wi_kernel_axes,
+        )
+      else:
+        self.wi_0 = nnx.Param(
+            self.kernel_init(
+                self.rngs.params(),
+                (num_experts, self.moe_expert_input_dim, intermediate_dim),
+                weight_dtype,
+                kernel_in_axis,
+                kernel_out_axis,
+            ),
+            sharding=self.wi_kernel_axes,
+        )
+        self.wi_1 = nnx.Param(
+            self.kernel_init(
+                self.rngs.params(),
+                (num_experts, self.moe_expert_input_dim, intermediate_dim),
+                weight_dtype,
+                kernel_in_axis,
+                kernel_out_axis,
+            ),
+            sharding=self.wi_kernel_axes,
+        )
       self.wo = nnx.Param(
           self.kernel_init(
               self.rngs.params(),
@@ -2547,8 +2560,7 @@ class RoutedMoE(nnx.Module):
       self,
       inputs: jax.Array,
       gate_kernel: jax.Array,
-      w0_kernel: jax.Array,
-      w1_kernel: jax.Array,
+      wi_kernel: jax.Array,
       wo_kernel: jax.Array,
       w0_bias: jax.Array | None,
       w1_bias: jax.Array | None,
@@ -2587,7 +2599,7 @@ class RoutedMoE(nnx.Module):
     self.quant.validate_moe_block_quantization_shapes(
         self.config.te_gmm_quantization,
         hidden_dim=inputs.shape[-1],
-        intermediate_dim=w0_kernel.shape[-1],
+        intermediate_dim=wi_kernel.shape[-1] // 2,
         fsdp_size=fsdp_size,
         shard_exp_on_fsdp=self.config.shard_exp_on_fsdp,
     )
@@ -2603,8 +2615,7 @@ class RoutedMoE(nnx.Module):
     output, lb_loss = te_moe.moe(
         inputs,
         gate_kernel,
-        w0_kernel,
-        w1_kernel,
+        wi_kernel,
         wo_kernel,
         w0_bias,
         w1_bias,
@@ -2652,8 +2663,7 @@ class RoutedMoE(nnx.Module):
 
     if cfg.te_moe_block:
       gate_kernel = jnp.asarray(self.gate.kernel[...], self.dtype)
-      w0_kernel = jnp.asarray(self.wi_0[...], self.dtype)
-      w1_kernel = jnp.asarray(self.wi_1[...], self.dtype)
+      wi_kernel = jnp.asarray(self.wi[...], self.dtype)
       wo_kernel = jnp.asarray(self.wo[...], self.dtype)
       if self.per_expert_scale is not None:
         wo_kernel = wo_kernel * jnp.asarray(self.per_expert_scale[...], self.dtype)[:, None, None]
@@ -2666,8 +2676,7 @@ class RoutedMoE(nnx.Module):
       return self._te_moe_block(
           inputs,
           gate_kernel,
-          w0_kernel,
-          w1_kernel,
+          wi_kernel,
           wo_kernel,
           w0_bias,
           w1_bias,
