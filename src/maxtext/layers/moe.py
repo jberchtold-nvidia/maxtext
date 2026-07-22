@@ -18,6 +18,7 @@
 import enum
 import functools
 import math
+import os
 import random
 from typing import Iterable, Optional, Tuple, Union
 
@@ -2614,6 +2615,13 @@ class RoutedMoE(nnx.Module):
         n_token_groups=fsdp_size * self.num_experts,
         n_expert_groups=self.num_experts,
     )
+
+    if os.getenv("NVTE_MAXTEXT_DO_FSDP_AG_IN_BF16", "0") == "1":
+      # All-gather the expert weights over FSDP before entering TE's MoE block,
+      # while retaining their expert-axis sharding.
+      expert_only_pspec = P(self._expert_parallelism_name, None, None)
+      wi_kernel = self._maybe_shard_with_pspec(wi_kernel, expert_only_pspec)
+      wo_kernel = self._maybe_shard_with_pspec(wo_kernel, expert_only_pspec)
 
     output, lb_loss = te_moe.moe(
         inputs,
