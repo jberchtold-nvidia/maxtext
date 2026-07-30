@@ -82,6 +82,210 @@ def get_first_step(model, state):
   return int(state.optimizer.step.get_value())
 
 
+def _debug_path_tokens(path):
+  """Convert a JAX key path to stable lowercase tokens for debug selection."""
+  tokens = []
+  for entry in path:
+    value = getattr(entry, "key", getattr(entry, "name", getattr(entry, "idx", entry)))
+    tokens.append(str(value).lower())
+  return tuple(tokens)
+
+
+def _debug_leaf_stats(leaves):
+  """Return stable float32 distribution diagnostics for selected leaves."""
+  if not leaves:
+    zero = jnp.asarray(0.0, jnp.float32)
+    return (zero,) * 6 + (jnp.asarray(1.0, jnp.float32),)
+  max_abs = jnp.asarray(0.0, jnp.float32)
+  nonzero = jnp.asarray(0.0, jnp.float32)
+  finite = jnp.asarray(0.0, jnp.float32)
+  values = []
+  # Keep this count as a Python float. Large MoE parameter groups can exceed
+  # int32 (79B elements in the current run), and a Python integer denominator
+  # would otherwise be canonicalized to JAX's default int32 inside the jit.
+  elements = 0.0
+  for leaf in leaves:
+    value = jnp.asarray(leaf, jnp.float32)
+    values.append(value)
+    is_finite = jnp.isfinite(value)
+    finite_value = jnp.where(is_finite, value, 0.0)
+    max_abs = jnp.maximum(max_abs, jnp.max(jnp.abs(finite_value)))
+    nonzero = nonzero + jnp.sum(value != 0, dtype=jnp.float32)
+    finite = finite + jnp.sum(is_finite, dtype=jnp.float32)
+    elements += float(value.size)
+
+  # Scaling before squaring prevents the diagnostic itself from overflowing,
+  # which happened to MaxText's ordinary global norm in the latest run.
+  safe_scale = jnp.where(max_abs > 0, max_abs, 1.0)
+  scaled_sum = jnp.asarray(0.0, jnp.float32)
+  scaled_abs_sum = jnp.asarray(0.0, jnp.float32)
+  scaled_square_sum = jnp.asarray(0.0, jnp.float32)
+  for value in values:
+    finite_value = jnp.where(jnp.isfinite(value), value, 0.0)
+    scaled_value = finite_value / safe_scale
+    scaled_sum = scaled_sum + jnp.sum(scaled_value)
+    scaled_abs_sum = scaled_abs_sum + jnp.sum(jnp.abs(scaled_value))
+    scaled_square_sum = scaled_square_sum + jnp.sum(jnp.square(scaled_value))
+  denominator = jnp.asarray(max(elements, 1.0), dtype=jnp.float32)
+  stable_norm = max_abs * jnp.sqrt(scaled_square_sum)
+  scaled_mean = scaled_sum / denominator
+  mean = max_abs * scaled_mean
+  abs_mean = max_abs * (scaled_abs_sum / denominator)
+  variance = jnp.maximum(scaled_square_sum / denominator - jnp.square(scaled_mean), 0.0)
+  stddev = max_abs * jnp.sqrt(variance)
+  return stable_norm, max_abs, mean, abs_mean, stddev, nonzero / denominator, finite / denominator
+
+
+def _add_training_debug_metrics(
+    scalar_metrics,
+    raw_grads,
+    old_params,
+    new_params,
+    num_decoder_layers,
+    first_num_dense_layers,
+    param_scan_axis,
+):
+  """Add bounded MoE/router gradient and sampled-update diagnostics."""
+  grad_path_leaves, _ = jax.tree_util.tree_flatten_with_path(raw_grads)
+  old_path_leaves, _ = jax.tree_util.tree_flatten_with_path(old_params)
+  new_path_leaves, _ = jax.tree_util.tree_flatten_with_path(new_params)
+
+  def is_expert_weight(path):
+    tokens = _debug_path_tokens(path)
+    return any("moe" in token for token in tokens) and any(
+        token in {"wi", "wo", "wi_0", "wi_1"} for token in tokens
+    )
+
+  def is_routed_expert_weight(path):
+    tokens = _debug_path_tokens(path)
+    return is_expert_weight(path) and "shared_experts" not in tokens
+
+  def is_shared_expert_weight(path):
+    return "shared_experts" in _debug_path_tokens(path)
+
+  def is_router_weight(path):
+    tokens = _debug_path_tokens(path)
+    return any("moe" in token for token in tokens) and "gate" in tokens and "kernel" in tokens
+
+  def is_attention_weight(path):
+    return "self_attention" in _debug_path_tokens(path)
+
+  def is_embedding_weight(path):
+    tokens = _debug_path_tokens(path)
+    return any("embed" in token for token in tokens) and "kernel" not in tokens
+
+  def is_norm_weight(path):
+    return any("norm" in token for token in _debug_path_tokens(path))
+
+  categories = {
+      "all": lambda path: True,
+      "expert": is_expert_weight,
+      "routed_expert": is_routed_expert_weight,
+      "shared_expert": is_shared_expert_weight,
+      "router": is_router_weight,
+      "attention": is_attention_weight,
+      "embedding": is_embedding_weight,
+      "norm": is_norm_weight,
+  }
+  for category, predicate in categories.items():
+    selected_grads = [leaf for path, leaf in grad_path_leaves if predicate(path)]
+    (
+        grad_norm,
+        grad_max,
+        grad_mean,
+        grad_abs_mean,
+        grad_stddev,
+        grad_nonzero,
+        grad_finite,
+    ) = _debug_leaf_stats(selected_grads)
+    scalar_metrics[f"debug/{category}_leaf_count"] = jnp.asarray(len(selected_grads), jnp.int32)
+    scalar_metrics[f"debug/{category}_raw_grad_norm"] = grad_norm
+    scalar_metrics[f"debug/{category}_raw_grad_max_abs"] = grad_max
+    scalar_metrics[f"debug/{category}_raw_grad_mean"] = grad_mean
+    scalar_metrics[f"debug/{category}_raw_grad_abs_mean"] = grad_abs_mean
+    scalar_metrics[f"debug/{category}_raw_grad_stddev"] = grad_stddev
+    scalar_metrics[f"debug/{category}_raw_grad_nonzero_fraction"] = grad_nonzero
+    scalar_metrics[f"debug/{category}_raw_grad_finite_fraction"] = grad_finite
+
+    if category not in ("expert", "router"):
+      continue
+
+    sampled_updates = []
+    sampled_params = []
+    for (old_path, old_leaf), (new_path, new_leaf) in zip(old_path_leaves, new_path_leaves):
+      if old_path != new_path:
+        raise ValueError(f"Parameter trees changed across optimizer update: {old_path} != {new_path}")
+      if predicate(old_path):
+        sample_size = min(old_leaf.size, 4096)
+        old_sample = jnp.ravel(old_leaf)[:sample_size].astype(jnp.float32)
+        new_sample = jnp.ravel(new_leaf)[:sample_size].astype(jnp.float32)
+        sampled_params.append(old_sample)
+        sampled_updates.append(new_sample - old_sample)
+
+    update_norm, update_max, _, _, _, update_nonzero, _ = _debug_leaf_stats(sampled_updates)
+    param_norm, _, _, _, _, _, _ = _debug_leaf_stats(sampled_params)
+    scalar_metrics[f"debug/{category}_sample_update_norm"] = update_norm
+    scalar_metrics[f"debug/{category}_sample_update_max_abs"] = update_max
+    scalar_metrics[f"debug/{category}_sample_update_nonzero_fraction"] = update_nonzero
+    scalar_metrics[f"debug/{category}_sample_relative_update"] = update_norm / (param_norm + EPS)
+
+  # Scanned decoder parameters carry the layer dimension at
+  # config.param_scan_axis. Resolve norms by layer so an activation-gradient
+  # amplification can be located even though all decoder blocks share one
+  # parameter-tree leaf.
+  scan_categories = {
+      "all": lambda path: True,
+      "expert": is_expert_weight,
+      "attention": is_attention_weight,
+  }
+
+  def unscanned_layer_index(path):
+    """Resolve DeepSeek's separately named dense/MoE layers when scan is off."""
+    for token in _debug_path_tokens(path):
+      for prefix, offset in (
+          ("dense_layers_", 0),
+          ("moe_layers_", first_num_dense_layers),
+      ):
+        if token.startswith(prefix):
+          suffix = token[len(prefix) :]
+          if suffix.isdigit():
+            return offset + int(suffix)
+    return None
+
+  for layer_index in range(num_decoder_layers):
+    for category, predicate in scan_categories.items():
+      layer_grads = []
+      for path, leaf in grad_path_leaves:
+        if not predicate(path):
+          continue
+        named_layer_index = unscanned_layer_index(path)
+        if named_layer_index is not None:
+          if named_layer_index == layer_index:
+            layer_grads.append(jnp.asarray(leaf))
+          continue
+        value = jnp.asarray(leaf)
+        if value.ndim <= param_scan_axis:
+          continue
+        scan_length = value.shape[param_scan_axis]
+        if scan_length == num_decoder_layers:
+          local_layer_index = layer_index
+        elif scan_length == first_num_dense_layers and layer_index < first_num_dense_layers:
+          local_layer_index = layer_index
+        elif (
+            scan_length == num_decoder_layers - first_num_dense_layers
+            and layer_index >= first_num_dense_layers
+        ):
+          local_layer_index = layer_index - first_num_dense_layers
+        else:
+          continue
+        layer_grads.append(jnp.take(value, local_layer_index, axis=param_scan_axis))
+      layer_norm, layer_max, _, _, _, _, layer_finite = _debug_leaf_stats(layer_grads)
+      prefix = f"debug/layer_{layer_index}_{category}"
+      scalar_metrics[f"{prefix}_raw_grad_norm"] = layer_norm
+      scalar_metrics[f"{prefix}_raw_grad_max_abs"] = layer_max
+      scalar_metrics[f"{prefix}_raw_grad_finite_fraction"] = layer_finite
+
+
 # -----------------------------------------------------------------------------
 # Top-level Functions
 # -----------------------------------------------------------------------------
@@ -453,6 +657,16 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
     scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
     scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
+  if os.environ.get("MAXTEXT_DEBUG_TRAINING_METRICS", "0") == "1":
+    _add_training_debug_metrics(
+        scalar_metrics,
+        raw_grads,
+        state.params,
+        new_state.params,
+        config.num_decoder_layers,
+        config.first_num_dense_layers,
+        config.param_scan_axis,
+    )
   if config.use_dpo:
     scalar_metrics["learning/dpo_loss"] = aux["dpo_loss"]
     scalar_metrics["learning/dpo_reward_accuracy"] = aux["reward_accuracy"]
@@ -580,7 +794,19 @@ def train_loop(config, recorder, state=None):
           with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
             if config.shard_optimizer_over_data:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+            debug_first_step = os.environ.get("MAXTEXT_DEBUG_FIRST_STEP", "0") == "1" and step == start_step
+            if debug_first_step:
+              max_logging.log(
+                  f"[train-step debug] entering p_train_step for step={step}; "
+                  "a missing return message means JIT lowering/compilation has not completed"
+              )
             state, metrics = p_train_step(state, example_batch, nextrng)
+            if debug_first_step:
+              max_logging.log(
+                  f"[train-step debug] p_train_step returned for step={step}; waiting for device completion"
+              )
+              jax.block_until_ready((state, metrics))
+              max_logging.log(f"[train-step debug] device completion observed for step={step}")
 
       step_time_delta = datetime.datetime.now() - last_step_completion
       last_step_completion = datetime.datetime.now()

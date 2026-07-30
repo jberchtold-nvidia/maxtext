@@ -53,6 +53,27 @@ _METRICS_TO_MANAGED = {
 }
 
 
+def _format_scalar_for_log(value, format_spec):
+  """Format a scalar metric without allowing diagnostics to stop training."""
+  try:
+    return format(value, format_spec)
+  except Exception:  # Diagnostic formatting must not terminate a training run.
+    pass
+
+  # Some sharded JAX scalars expose a string through __format__/.item() even
+  # though the value is numeric. Convert numeric strings when possible, and
+  # retain a printable representation for any other scalar-like value.
+  if hasattr(value, "item"):
+    try:
+      value = value.item()
+    except Exception:  # A non-addressable global JAX scalar may reject .item().
+      pass
+  try:
+    return format(float(value), format_spec)
+  except Exception:
+    return str(value)
+
+
 def _prepare_metrics_for_json(metrics, step, run_name):
   """Converts metric dictionary into json supported types (e.g. float)"""
   metrics_dict = {val: float(metrics["scalar"][val]) for val in metrics["scalar"]}
@@ -175,11 +196,73 @@ class MetricLogger:
     log_parts.extend(
         [
             f"total_weights: {scalars['learning/total_weights']}",
-            f"loss: {loss:.3f}",
-            f"lm_loss: {lm_loss:.3f}",
+            f"loss: {loss:.6f}",
+            f"lm_loss: {lm_loss:.6f}",
             f"perplexity: {perplexity:.3f}",
+            f"lr: {scalars.get('learning/current_learning_rate', 0.0):.3e}",
         ]
     )
+    for category in ("expert", "router"):
+      prefix = f"debug/{category}"
+      if f"{prefix}_leaf_count" in scalars:
+        log_parts.extend(
+            [
+                f"{category}_leaves: {_format_scalar_for_log(scalars[f'{prefix}_leaf_count'], '.0f')}",
+                f"{category}_raw_grad_norm: {_format_scalar_for_log(scalars[f'{prefix}_raw_grad_norm'], '.6e')}",
+                f"{category}_grad_mean: {_format_scalar_for_log(scalars[f'{prefix}_raw_grad_mean'], '.6e')}",
+                f"{category}_grad_abs_mean: "
+                f"{_format_scalar_for_log(scalars[f'{prefix}_raw_grad_abs_mean'], '.6e')}",
+                f"{category}_grad_std: {_format_scalar_for_log(scalars[f'{prefix}_raw_grad_stddev'], '.6e')}",
+                f"{category}_grad_absmax: {_format_scalar_for_log(scalars[f'{prefix}_raw_grad_max_abs'], '.6e')}",
+                f"{category}_grad_nz: "
+                f"{_format_scalar_for_log(scalars[f'{prefix}_raw_grad_nonzero_fraction'], '.6f')}",
+                f"{category}_grad_finite: "
+                f"{_format_scalar_for_log(scalars[f'{prefix}_raw_grad_finite_fraction'], '.6f')}",
+                f"{category}_update_norm: {_format_scalar_for_log(scalars[f'{prefix}_sample_update_norm'], '.6e')}",
+                f"{category}_update_max: {_format_scalar_for_log(scalars[f'{prefix}_sample_update_max_abs'], '.6e')}",
+                f"{category}_update_nz: "
+                f"{_format_scalar_for_log(scalars[f'{prefix}_sample_update_nonzero_fraction'], '.6f')}",
+                f"{category}_relative_update: "
+                f"{_format_scalar_for_log(scalars[f'{prefix}_sample_relative_update'], '.6e')}",
+            ]
+        )
+    for category in ("all", "routed_expert", "shared_expert", "attention", "embedding", "norm"):
+      prefix = f"debug/{category}"
+      if f"{prefix}_leaf_count" in scalars:
+        log_parts.extend(
+            [
+                f"{category}_grad_norm: {_format_scalar_for_log(scalars[f'{prefix}_raw_grad_norm'], '.6e')}",
+                f"{category}_grad_mean: {_format_scalar_for_log(scalars[f'{prefix}_raw_grad_mean'], '.6e')}",
+                f"{category}_grad_abs_mean: "
+                f"{_format_scalar_for_log(scalars[f'{prefix}_raw_grad_abs_mean'], '.6e')}",
+                f"{category}_grad_std: {_format_scalar_for_log(scalars[f'{prefix}_raw_grad_stddev'], '.6e')}",
+                f"{category}_grad_absmax: {_format_scalar_for_log(scalars[f'{prefix}_raw_grad_max_abs'], '.6e')}",
+                f"{category}_grad_finite: "
+                f"{_format_scalar_for_log(scalars[f'{prefix}_raw_grad_finite_fraction'], '.6f')}",
+            ]
+        )
+    for layer_index in range(self.config.num_decoder_layers):
+      for category in ("all", "expert", "attention"):
+        prefix = f"debug/layer_{layer_index}_{category}"
+        if f"{prefix}_raw_grad_norm" in scalars:
+          log_parts.extend(
+              [
+                  f"layer{layer_index}_{category}_grad_norm: "
+                  f"{_format_scalar_for_log(scalars[f'{prefix}_raw_grad_norm'], '.6e')}",
+                  f"layer{layer_index}_{category}_grad_absmax: "
+                  f"{_format_scalar_for_log(scalars[f'{prefix}_raw_grad_max_abs'], '.6e')}",
+                  f"layer{layer_index}_{category}_grad_finite: "
+                  f"{_format_scalar_for_log(scalars[f'{prefix}_raw_grad_finite_fraction'], '.6f')}",
+              ]
+          )
+    if "learning/grad_norm" in scalars:
+      log_parts.extend(
+          [
+              f"grad_norm: {_format_scalar_for_log(scalars['learning/grad_norm'], '.6e')}",
+              f"raw_grad_norm: {_format_scalar_for_log(scalars['learning/raw_grad_norm'], '.6e')}",
+              f"param_norm: {_format_scalar_for_log(scalars['learning/param_norm'], '.6e')}",
+          ]
+      )
     if self.config.use_dpo:
       dpo_loss = scalars.get("learning/dpo_loss", 0.0)
       log_parts.append(f"dpo_loss: {dpo_loss:.3f}")

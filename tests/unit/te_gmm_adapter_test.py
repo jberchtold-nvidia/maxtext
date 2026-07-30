@@ -74,7 +74,7 @@ def test_te_gmm_adapter_local_ep_axis(monkeypatch):
   assert ep_local_output.shape == (1, 128, 32)
 
 
-def test_moe_block_quantizer_set_uses_inferred_group_counts():
+def test_moe_block_quantizer_set_keeps_distinct_token_and_expert_group_counts():
   quant = quantizations.TransformerEngineQuantization(SimpleNamespace(quantization="te_mxfp8"))
   quantizer_set = quant.get_moe_block_quantizer_set(
       "te_mxfp8", n_token_groups=64, n_expert_groups=32
