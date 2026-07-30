@@ -408,9 +408,10 @@ class RoutedMoE(nnx.Module):
     if self.config.shard_exp_on_fsdp:
       # Shard the expert dimension across both FSDP and EP. This avoids
       # replicating FSDP-owned expert shards across the expert mesh axis.
-      # Keep FSDP outermost and EP/expert innermost so TE's dispatch-group
-      # order and post-quantization FSDP gather agree on expert identity.
-      expert_fsdp_axes = ("fsdp", "expert")
+      # Keep the expert axis outermost so dropping FSDP for the quantized
+      # grouped-GEMM RHS all-gather is a direct gather, not an expert/FSDP
+      # layout transpose followed by a gather.
+      expert_fsdp_axes = ("expert", "fsdp")
       self.wi_kernel_axes = (expert_fsdp_axes, None, "mlp_moe")
       self.wo_kernel_axes = (expert_fsdp_axes, "mlp_moe", None)
     elif self.config.use_2d_fsdp_sharding:
@@ -2571,13 +2572,6 @@ class RoutedMoE(nnx.Module):
       out_sharding: NamedSharding | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params."""
-    if os.getenv("NVTE_MAXTEXT_SKIP_TE_MOE_CALL", "0") == "1":
-      # Strong scan-isolation diagnostic: retain the MaxText RoutedMoE module,
-      # its scanned parameters, and the surrounding residual/shared-expert
-      # graph, but do not stage TE's custom_vjp at all. This distinguishes a
-      # scan/custom-VJP interaction from every operation inside the TE rule.
-      return jnp.zeros_like(inputs), None, None
-
     try:
       from transformer_engine.jax import moe as te_moe  # pylint: disable=import-outside-toplevel
     except ImportError as exc:
@@ -2615,10 +2609,9 @@ class RoutedMoE(nnx.Module):
     )
     fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
         self.config.te_gmm_quantization,
-        # Dispatch buffers have one group per (fsdp, ep, local_expert).
-        # Expert weights retain their global expert-group shape through
-        # grouped quantization and are gathered over FSDP inside TE's
-        # grouped-GEMM partition boundary.
+        # Dispatch buffers have one group per (fsdp, ep, local_expert),
+        # while model weights retain their global expert-group shape until
+        # TE's grouped-GEMM partitioning gathers the quantized FSDP shard.
         n_token_groups=fsdp_size * self.num_experts,
         n_expert_groups=self.num_experts,
     )
@@ -2648,9 +2641,7 @@ class RoutedMoE(nnx.Module):
         group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
         scaling_factor=self.config.routed_scaling_factor,
         aux_loss_coeff=self.config.load_balance_loss_weight,
-        # Diagnostic A/B: retain the previously working late-weighting
-        # semantics while testing the global-view custom-partitioning path.
-        apply_topk_weights_early=False,
+        apply_topk_weights_early=True,
         quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
         ep_axis=self._expert_parallelism_name,
         data_parallelism_axes=("fsdp",),
