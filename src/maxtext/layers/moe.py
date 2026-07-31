@@ -408,10 +408,9 @@ class RoutedMoE(nnx.Module):
     if self.config.shard_exp_on_fsdp:
       # Shard the expert dimension across both FSDP and EP. This avoids
       # replicating FSDP-owned expert shards across the expert mesh axis.
-      # Keep the expert axis outermost so dropping FSDP for the quantized
-      # grouped-GEMM RHS all-gather is a direct gather, not an expert/FSDP
-      # layout transpose followed by a gather.
-      expert_fsdp_axes = ("expert", "fsdp")
+      # Keep FSDP outermost to match TE's (fsdp, ep, local_expert)
+      # dispatch-group and grouped-wgrad layout.
+      expert_fsdp_axes = ("fsdp", "expert")
       self.wi_kernel_axes = (expert_fsdp_axes, None, "mlp_moe")
       self.wo_kernel_axes = (expert_fsdp_axes, "mlp_moe", None)
     elif self.config.use_2d_fsdp_sharding:
