@@ -20,6 +20,7 @@ import collections
 from collections.abc import Sequence
 import functools
 from functools import partial
+import math
 import os
 import socket
 import re
@@ -1190,16 +1191,20 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
 
   effective_align = max(int(config.moe_permutation_group_align_size), 128)
   max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
-  recv_capacity_factor = config.ragged_buffer_factor if config.ragged_buffer_factor > 0 else None
-  recv_capacity_per_rank = get_moe_recv_capacity_per_rank(
+  worst_case_recv_capacity_per_rank = get_moe_recv_capacity_per_rank(
       num_experts=config.num_experts,
       num_experts_per_tok=config.num_experts_per_tok,
       max_tokens_per_rank=max_tokens_per_rank,
       ep_size=ep_size,
-      recv_capacity_factor=recv_capacity_factor,
       alignment=effective_align,
   )
-  drop_on_overflow = recv_capacity_factor is not None
+  recv_capacity_fraction = float(config.te_ep_receive_capacity_fraction)
+  recv_capacity_per_rank = min(
+      worst_case_recv_capacity_per_rank,
+      math.ceil(worst_case_recv_capacity_per_rank * recv_capacity_fraction / effective_align)
+      * effective_align,
+  )
+  drop_on_overflow = recv_capacity_per_rank < worst_case_recv_capacity_per_rank
   hidden_dim = config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim
 
   signature = (
@@ -1227,7 +1232,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
         f"world={jax.process_count()} rank={jax.process_index()} ep={ep_size} "
         f"num_experts={config.num_experts} max_tokens_per_rank={max_tokens_per_rank} "
         f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim} "
-        f"recv_capacity_factor={recv_capacity_factor} drop_on_overflow={drop_on_overflow}"
+        f"recv_capacity_fraction={recv_capacity_fraction} drop_on_overflow={drop_on_overflow}"
     )
     ep_bootstrap(
         world_size=jax.process_count(),

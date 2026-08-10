@@ -662,10 +662,7 @@ class MoEGeneral(BaseModel):
   capacity_factor: float = Field(-1.0, description="Expert capacity factor. If < 0, no token dropping.")
   ragged_buffer_factor: float = Field(
       -1.0,
-      description=(
-          "Receive-buffer capacity relative to balanced routing. If < 0, use worst-case size; "
-          "the TE MoEBlock requires values >= 1.0 and reports overflow as a failed step."
-      ),
+      description="Ragged-buffer factor for MaxText sparse MoE. If < 0, use the worst-case size.",
   )
   moe_expert_input_dim: int = Field(
       -1,
@@ -696,6 +693,22 @@ class MoEGeneral(BaseModel):
   te_moe_block: bool = Field(
       False,
       description="Whether to use TransformerEngine's fused EP MoEBlock for routing, dispatch, grouped GEMM, and combine.",
+  )
+  te_ep_receive_capacity_fraction: float = Field(
+      1.0,
+      gt=0.0,
+      le=1.0,
+      description=(
+          "TE EP receive capacity as a fraction of the aligned dropless worst case. "
+          "A value of 1.0 is dropless; smaller values may overflow."
+      ),
+  )
+  te_ep_overflow_check_every_n_steps: PositiveInt = Field(
+      20,
+      description=(
+          "Number of training steps buffered between host-side TE EP receive-capacity overflow checks. "
+          "Overflowing steps still skip their optimizer update immediately on device."
+      ),
   )
   te_gmm_quantization: None | TEGroupedGemmQuantizationType = Field(
       TEGroupedGemmQuantizationType.EMPTY,
@@ -2128,10 +2141,6 @@ class MaxTextConfig(
     return values
 
   def validate_ragged_buffer_factor(self):
-    if self.te_moe_block and 0 <= self.ragged_buffer_factor < 1.0:
-      raise ValueError(
-          "te_moe_block requires ragged_buffer_factor >= 1.0, or a negative value for worst-case capacity."
-      )
     if self.ragged_buffer_factor <= 0:
       return  # Nothing to validate if not using ragged buffer factor
     if self.use_ring_of_experts:

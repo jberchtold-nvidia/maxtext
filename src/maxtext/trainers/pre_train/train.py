@@ -607,6 +607,7 @@ def train_loop(config, recorder, state=None):
   metric_logger.write_setup_info_to_tensorboard(state.params)
 
   _job_completed_gracefully = False
+  te_moe_overflow_window = []
   try:
     last_step_completion = datetime.datetime.now()
     for step in np.arange(start_step, config.steps):
@@ -623,24 +624,39 @@ def train_loop(config, recorder, state=None):
             state, metrics = p_train_step(state, example_batch, nextrng)
 
       if config.te_moe_block:
-        overflow = bool(
-            np.asarray(jax.device_get(metrics["scalar"]["learning/te_moe_capacity_overflow"]))
+        te_moe_overflow_window.append(
+            (
+                int(step),
+                metrics["scalar"]["learning/te_moe_capacity_overflow"],
+                metrics["scalar"]["learning/te_moe_max_total_recv_tokens"],
+                metrics["scalar"]["learning/te_moe_recv_capacity_per_rank"],
+            )
         )
-        if overflow:
-          observed = int(
-              np.asarray(jax.device_get(metrics["scalar"]["learning/te_moe_max_total_recv_tokens"]))
-          )
-          capacity = int(
-              np.asarray(jax.device_get(metrics["scalar"]["learning/te_moe_recv_capacity_per_rank"]))
-          )
+        check_overflow = (
+            len(te_moe_overflow_window) == config.te_ep_overflow_check_every_n_steps
+            or step == config.steps - 1
+        )
+        if check_overflow:
+          checked_window = jax.device_get(tuple(te_moe_overflow_window))
+          overflowing_steps = [entry for entry in checked_window if bool(np.asarray(entry[1]))]
+          te_moe_overflow_window.clear()
+        else:
+          overflowing_steps = []
+
+        if overflowing_steps:
+          overflow_step = overflowing_steps[0][0]
+          observed = max(int(np.asarray(entry[2])) for entry in overflowing_steps)
+          capacity = min(int(np.asarray(entry[3])) for entry in overflowing_steps)
           prof.deactivate()
           message = (
               "TE MoE receive capacity overflow at training step "
-              f"{step}: observed padded receive demand {observed} exceeds "
+              f"{overflow_step} (detected at the {config.te_ep_overflow_check_every_n_steps}-step "
+              f"check ending at step {step}): "
+              f"observed padded receive demand {observed} exceeds "
               f"recv_capacity_per_rank {capacity} "
-              f"(ragged_buffer_factor={config.ragged_buffer_factor}). "
-              "The optimizer update was skipped; increase ragged_buffer_factor "
-              "or set it to -1 for worst-case dropless capacity."
+              f"(te_ep_receive_capacity_fraction={config.te_ep_receive_capacity_fraction}). "
+              "The optimizer update was skipped; increase te_ep_receive_capacity_fraction "
+              "up to 1.0 for worst-case dropless capacity."
           )
           max_logging.error(message)
           raise RuntimeError(message)
