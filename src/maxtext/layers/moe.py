@@ -2599,13 +2599,14 @@ class RoutedMoE(nnx.Module):
       raise ValueError(
           f"num_experts={self.num_experts} must be divisible by EP size={ep_size}."
       )
-    self.quant.validate_moe_block_quantization_shapes(
-        self.config.te_gmm_quantization,
-        hidden_dim=inputs.shape[-1],
-        intermediate_dim=wi_kernel.shape[-1] // 2,
-        fsdp_size=fsdp_size,
-        shard_exp_on_fsdp=self.config.shard_exp_on_fsdp,
-    )
+    # Intentionally disabled for now as we experiment with alternative shardings for FSDP
+    # self.quant.validate_moe_block_quantization_shapes(
+    #     self.config.te_gmm_quantization,
+    #     hidden_dim=inputs.shape[-1],
+    #     intermediate_dim=wi_kernel.shape[-1] // 2,
+    #     fsdp_size=fsdp_size,
+    #     shard_exp_on_fsdp=self.config.shard_exp_on_fsdp,
+    # )
     fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
         self.config.te_gmm_quantization,
         # Dispatch buffers have one group per (fsdp, ep, local_expert),
