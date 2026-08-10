@@ -2622,7 +2622,7 @@ class RoutedMoE(nnx.Module):
       wi_kernel = self._maybe_shard_with_pspec(wi_kernel, expert_only_pspec)
       wo_kernel = self._maybe_shard_with_pspec(wo_kernel, expert_only_pspec)
 
-    output, lb_loss = te_moe.moe(
+    output, lb_loss, total_recv_tokens = te_moe.moe(
         inputs,
         gate_kernel,
         wi_kernel,
@@ -2649,13 +2649,15 @@ class RoutedMoE(nnx.Module):
         wi_kernel_axes=self.wi_kernel_axes,
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
+        recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
     )
+    recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
     if lb_loss is not None:
       lb_loss = lb_loss.astype(self.dtype)
     if out_sharding is not None:
       output = jax.lax.with_sharding_constraint(output, out_sharding)
-    return output, lb_loss, None
+    return output, lb_loss, (total_recv_tokens, jnp.asarray(recv_capacity_per_rank, dtype=jnp.int32))
 
   def __call__(
       self, inputs: jax.Array, gate_inputs: jax.Array | None = None, out_sharding: NamedSharding | None = None

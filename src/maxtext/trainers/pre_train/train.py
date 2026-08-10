@@ -259,6 +259,25 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     nested_key = ("intermediates", "decoder", "moe_layers", "moe_bias_updates")
     moe_bias_updates = maxtext_utils.get_nested_value(intermediate_outputs, nested_key, None)
 
+  te_moe_capacity_overflow = jnp.asarray(False)
+  te_moe_max_total_recv_tokens = jnp.asarray(0, dtype=jnp.int32)
+  te_moe_recv_capacity_per_rank = jnp.asarray(0, dtype=jnp.int32)
+  if config.te_moe_block:
+    overflow_values = maxtext_utils.collect_intermediates_by_suffix(
+        intermediate_outputs, "te_moe_capacity_overflow"
+    )
+    total_recv_values = maxtext_utils.collect_intermediates_by_suffix(
+        intermediate_outputs, "te_moe_total_recv_tokens"
+    )
+    capacity_values = maxtext_utils.collect_intermediates_by_suffix(
+        intermediate_outputs, "te_moe_recv_capacity_per_rank"
+    )
+    if not overflow_values or not total_recv_values or not capacity_values:
+      raise ValueError("te_moe_block=True did not produce TE MoE receive-capacity intermediates.")
+    te_moe_capacity_overflow = jnp.any(jnp.concatenate(overflow_values))
+    te_moe_max_total_recv_tokens = jnp.max(jnp.concatenate(total_recv_values))
+    te_moe_recv_capacity_per_rank = jnp.min(jnp.concatenate(capacity_values))
+
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
   intermediate_outputs["logits"] = logits
@@ -272,6 +291,9 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       "indexer_loss": indexer_loss,
       "moe_bias_updates": moe_bias_updates,
       "mtp_loss": mtp_loss,
+      "te_moe_capacity_overflow": te_moe_capacity_overflow,
+      "te_moe_max_total_recv_tokens": te_moe_max_total_recv_tokens,
+      "te_moe_recv_capacity_per_rank": te_moe_recv_capacity_per_rank,
   }
   return loss, aux
 
@@ -350,6 +372,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   z_loss = aux.get("z_loss", 0.0)
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
+  te_moe_capacity_overflow = aux.get("te_moe_capacity_overflow", jnp.asarray(False))
+  te_moe_max_total_recv_tokens = aux.get("te_moe_max_total_recv_tokens", jnp.asarray(0, dtype=jnp.int32))
+  te_moe_recv_capacity_per_rank = aux.get("te_moe_recv_capacity_per_rank", jnp.asarray(0, dtype=jnp.int32))
 
   if config.gradient_clipping_threshold > 0:
     grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
@@ -401,33 +426,48 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         )
     )
 
-  if getattr(config, "skip_step_on_spikes", False):
-    grad_norm = max_utils.l2norm_pytree(grads)
-    # TrainState.apply_gradients doesn't pass **kwargs to tx.update, so we unpack it manually.
-    updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params, loss=loss, grad_norm=grad_norm)
-    new_params = optax.apply_updates(state.params, updates)
+  def apply_training_updates(current_state):
+    """Apply every mutable training-state update for a valid MoE step."""
+    if getattr(config, "skip_step_on_spikes", False):
+      grad_norm = max_utils.l2norm_pytree(grads)
+      # TrainState.apply_gradients doesn't pass **kwargs to tx.update, so unpack it manually.
+      updates, new_opt_state = current_state.tx.update(
+          grads, current_state.opt_state, current_state.params, loss=loss, grad_norm=grad_norm
+      )
+      new_params = optax.apply_updates(current_state.params, updates)
+      updated_state = current_state.replace(
+          step=current_state.step + 1,
+          params=new_params,
+          opt_state=new_opt_state,
+      )
+    else:
+      updated_state = current_state.apply_gradients(grads=grads)
 
-    new_state = state.replace(
-        step=state.step + 1,
-        params=new_params,
-        opt_state=new_opt_state,
-    )
-  else:
-    new_state = state.apply_gradients(grads=grads)
+    # Restore sanitized OWG values, bypassing any optimizer update to fp8 stats.
+    if fp8_stats is not None:
+      new_params = dict(updated_state.params)
+      new_params[maxtext_utils.OVERWRITE_WITH_GRADIENT] = fp8_stats
+      updated_state = updated_state.replace(params=new_params)
 
-  # fp8 fix: restore sanitized OWG values, bypassing any optimizer update to fp8 stats.
-  if fp8_stats is not None:
-    new_params = dict(new_state.params)
-    new_params[maxtext_utils.OVERWRITE_WITH_GRADIENT] = fp8_stats
-    new_state = new_state.replace(params=new_params)
+    # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family.
+    if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
+      target_path = ("params", "decoder", "moe_layers", "DeepSeekMoeBlock_0", "MoeBlock_0", "gate", "bias")
+      bias_updates = jnp.array(moe_bias_updates[0]).transpose()
+      updated_state = maxtext_utils.update_state_param(updated_state, target_path, bias_updates)
 
-  # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
-  if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
-    target_path = ("params", "decoder", "moe_layers", "DeepSeekMoeBlock_0", "MoeBlock_0", "gate", "bias")
-    # Flax 'sow' returns a tuple, so we take the first element [0].
-    # Updates the shape to be aligned with state.
-    moe_bias_updates = jnp.array(moe_bias_updates[0]).transpose()
-    new_state = maxtext_utils.update_state_param(new_state, target_path, moe_bias_updates)
+    if config.use_qk_clip:
+      updated_state = qk_clip_utils.apply_qk_clip(updated_state, intermediate_outputs, config)
+    return updated_state
+
+  # Dropped expert tokens invalidate both the forward result and its gradients.
+  # The replicated condition prevents parameters, optimizer/FP8 state, auxiliary
+  # updates, and the step counter from changing on an overflowing step.
+  new_state = jax.lax.cond(
+      te_moe_capacity_overflow,
+      lambda current_state: current_state,
+      apply_training_updates,
+      state,
+  )
 
   lm_loss = xent_sum / (total_weights + EPS)
   scalar_metrics = {
@@ -439,11 +479,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/indexer_loss": indexer_loss,
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
+      "learning/te_moe_capacity_overflow": te_moe_capacity_overflow.astype(jnp.int32),
+      "learning/te_moe_max_total_recv_tokens": te_moe_max_total_recv_tokens,
+      "learning/te_moe_recv_capacity_per_rank": te_moe_recv_capacity_per_rank,
   }
   if config.use_qk_clip:
-    # Apply QK-Clip
-    new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)
-
     # Report max_logits metric
     global_max_logit = qk_clip_utils.calculate_max_logit_metric(intermediate_outputs)
     if global_max_logit is not None:
@@ -581,6 +621,29 @@ def train_loop(config, recorder, state=None):
             if config.shard_optimizer_over_data:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
+
+      if config.te_moe_block:
+        overflow = bool(
+            np.asarray(jax.device_get(metrics["scalar"]["learning/te_moe_capacity_overflow"]))
+        )
+        if overflow:
+          observed = int(
+              np.asarray(jax.device_get(metrics["scalar"]["learning/te_moe_max_total_recv_tokens"]))
+          )
+          capacity = int(
+              np.asarray(jax.device_get(metrics["scalar"]["learning/te_moe_recv_capacity_per_rank"]))
+          )
+          prof.deactivate()
+          message = (
+              "TE MoE receive capacity overflow at training step "
+              f"{step}: observed padded receive demand {observed} exceeds "
+              f"recv_capacity_per_rank {capacity} "
+              f"(ragged_buffer_factor={config.ragged_buffer_factor}). "
+              "The optimizer update was skipped; increase ragged_buffer_factor "
+              "or set it to -1 for worst-case dropless capacity."
+          )
+          max_logging.error(message)
+          raise RuntimeError(message)
 
       step_time_delta = datetime.datetime.now() - last_step_completion
       last_step_completion = datetime.datetime.now()

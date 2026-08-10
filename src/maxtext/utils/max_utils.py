@@ -1150,19 +1150,11 @@ def transformer_engine_context():
 _te_moe_bootstrap_signature = None
 
 
-def _te_moe_recv_capacity_per_rank(ep_size, max_tokens_per_rank, num_experts_per_tok, num_local_experts, alignment):
-  """Mirror TE MoE's worst-case aligned receive-capacity bound."""
-  tokens_per_ep_group = ep_size * max_tokens_per_rank
-  max_local_assignments = tokens_per_ep_group * min(num_experts_per_tok, num_local_experts)
-  max_nonempty_experts = min(num_local_experts, max_local_assignments)
-  padded_total_bound = max_local_assignments + (alignment - 1) * max_nonempty_experts
-  aligned_total_bound = ((padded_total_bound + alignment - 1) // alignment) * alignment
-  per_expert_bound = (
-      num_local_experts
-      * ((tokens_per_ep_group + alignment - 1) // alignment)
-      * alignment
-  )
-  return min(per_expert_bound, aligned_total_bound)
+def get_te_moe_recv_capacity_per_rank():
+  """Return the exact receive capacity used by the process-local TE bootstrap."""
+  if _te_moe_bootstrap_signature is None:
+    raise RuntimeError("TE MoE EP has not been bootstrapped yet.")
+  return _te_moe_bootstrap_signature[5]
 
 
 def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
@@ -1179,6 +1171,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   try:
     from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
     from transformer_engine.jax.moe import (  # pylint: disable=import-outside-toplevel
+        get_moe_recv_capacity_per_rank,
         record_ep_bootstrap_signature_for_moe,
     )
   except ImportError as exc:
@@ -1192,19 +1185,21 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   fsdp_size = mesh.shape.get(fsdp_axis, 1)
 
   batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
-  num_local_experts = config.num_experts // ep_size
   if config.num_experts % ep_size != 0:
     raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
 
   effective_align = max(int(config.moe_permutation_group_align_size), 128)
   max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
-  recv_capacity_per_rank = _te_moe_recv_capacity_per_rank(
-      ep_size,
-      max_tokens_per_rank,
-      config.num_experts_per_tok,
-      num_local_experts,
-      effective_align,
+  recv_capacity_factor = config.ragged_buffer_factor if config.ragged_buffer_factor > 0 else None
+  recv_capacity_per_rank = get_moe_recv_capacity_per_rank(
+      num_experts=config.num_experts,
+      num_experts_per_tok=config.num_experts_per_tok,
+      max_tokens_per_rank=max_tokens_per_rank,
+      ep_size=ep_size,
+      recv_capacity_factor=recv_capacity_factor,
+      alignment=effective_align,
   )
+  drop_on_overflow = recv_capacity_factor is not None
   hidden_dim = config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim
 
   signature = (
@@ -1215,6 +1210,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
       max_tokens_per_rank,
       recv_capacity_per_rank,
       hidden_dim,
+      drop_on_overflow,
   )
   global _te_moe_bootstrap_signature
   if _te_moe_bootstrap_signature == signature:
@@ -1230,7 +1226,8 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
         "Bootstrapping TE MoE EP: "
         f"world={jax.process_count()} rank={jax.process_index()} ep={ep_size} "
         f"num_experts={config.num_experts} max_tokens_per_rank={max_tokens_per_rank} "
-        f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim}"
+        f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim} "
+        f"recv_capacity_factor={recv_capacity_factor} drop_on_overflow={drop_on_overflow}"
     )
     ep_bootstrap(
         world_size=jax.process_count(),
@@ -1240,6 +1237,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
         recv_capacity_per_rank=recv_capacity_per_rank,
         hidden_dim=hidden_dim,
         max_token_dtype=config.dtype,
+        drop_on_overflow=drop_on_overflow,
     )
     record_ep_bootstrap_signature_for_moe(
         num_experts=config.num_experts,

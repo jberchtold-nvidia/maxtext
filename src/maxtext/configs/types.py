@@ -660,7 +660,13 @@ class MoEGeneral(BaseModel):
   num_experts: PositiveInt = Field(1, description="The total number of experts in each MoE layer.")
   num_experts_per_tok: PositiveInt = Field(1, description="The number of experts to route each token to.")
   capacity_factor: float = Field(-1.0, description="Expert capacity factor. If < 0, no token dropping.")
-  ragged_buffer_factor: float = Field(-1.0, description="Ragged buffer factor. If < 0, ragged buffer is worst case size.")
+  ragged_buffer_factor: float = Field(
+      -1.0,
+      description=(
+          "Receive-buffer capacity relative to balanced routing. If < 0, use worst-case size; "
+          "the TE MoEBlock requires values >= 1.0 and reports overflow as a failed step."
+      ),
+  )
   moe_expert_input_dim: int = Field(
       -1,
       description="Dimension of tokens entering the MoE layer. If < 0, defaults to emb_dim.",
@@ -2122,6 +2128,10 @@ class MaxTextConfig(
     return values
 
   def validate_ragged_buffer_factor(self):
+    if self.te_moe_block and 0 <= self.ragged_buffer_factor < 1.0:
+      raise ValueError(
+          "te_moe_block requires ragged_buffer_factor >= 1.0, or a negative value for worst-case capacity."
+      )
     if self.ragged_buffer_factor <= 0:
       return  # Nothing to validate if not using ragged buffer factor
     if self.use_ring_of_experts:

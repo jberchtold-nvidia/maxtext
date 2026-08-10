@@ -132,7 +132,16 @@ def gradient_accumulation_loss_and_grad(
   raw_grads = grad_and_loss["grad"]
   raw_grads = jax.tree.map(_maybe_shard_with_name, raw_grads, params_shardings)
   raw_grads = jax.tree_util.tree_map(lambda arr: arr / grad_and_loss["total_weights"], raw_grads)
-  aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), aux)  # pytype: disable=module-attr
+  scanned_aux = aux
+  aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), scanned_aux)  # pytype: disable=module-attr
+  if "te_moe_capacity_overflow" in scanned_aux:
+    aux["te_moe_capacity_overflow"] = jnp.any(scanned_aux["te_moe_capacity_overflow"], axis=0)
+    aux["te_moe_max_total_recv_tokens"] = jnp.max(
+        scanned_aux["te_moe_max_total_recv_tokens"], axis=0
+    )
+    aux["te_moe_recv_capacity_per_rank"] = jnp.min(
+        scanned_aux["te_moe_recv_capacity_per_rank"], axis=0
+    )
 
   return loss, aux, raw_grads
 
