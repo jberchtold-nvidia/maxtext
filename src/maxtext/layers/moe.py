@@ -2651,6 +2651,9 @@ class RoutedMoE(nnx.Module):
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
+        ffn1_gate_ckpt_name="moe_mlpwi_0",
+        ffn1_up_ckpt_name="moe_mlpwi_1",
+        ffn2_ckpt_name="moe_mlpwo",
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
