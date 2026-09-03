@@ -999,6 +999,28 @@ def reorder_causal_load_balanced(batch, cp_size, reorder_strategy, hardware="tpu
     }
 
 
+def reordered_cp_size(config, mesh) -> int:
+  """The cp_size the input pipeline reordered the batch with; 1 if it did not.
+
+  `setup_train_loop` wraps the data iterators once, at setup, using
+  ``mesh.shape[config.context_sharding]`` resolved against the *train*
+  `logical_axis_rules`. Everything that assumes the batch carries that
+  DUAL_CHUNK_SWAP permutation - the ``LoadBalanced*`` Splash masks, the
+  contiguous-order restore of K/V in `wrap_flash_attention`, MTP's
+  shift-by-one - has to key off this number and not off whatever shard count
+  the ambient rules imply. The two can differ: the eval step runs under
+  `logical_axis_rules_for_eval` when `custom_mesh_and_rule_for_eval` is set,
+  so a train mesh with no CP can hand the kernel a 4-way sharded query over a
+  batch that was never reordered.
+
+  Returns 1 whenever the batch is in natural token order, i.e. load balancing
+  is off or the CP axis is absent from the mesh / of size 1.
+  """
+  if mesh is None or not getattr(config, "context_parallel_load_balance", False):
+    return 1
+  return mesh.shape.get(config.context_sharding, 1)
+
+
 @staticmethod
 def reorder_mask_load_balancing(tensor, cp_size: int, seq_dim: int):
   """
@@ -1236,11 +1258,115 @@ def transformer_engine_context():
         fsdp_resource="fsdp",
         pp_resource=None,  # pyrefly: ignore[bad-argument-type]
         cp_resource="context",
+        ep_resource="expert",
     )
     with global_shard_guard(mesh_resource):
       yield
-  except (ImportError, AttributeError):
+  except Exception:  # pylint: disable=broad-exception-caught
     yield
+
+
+_te_moe_bootstrap_signature = None
+
+
+def get_te_moe_recv_capacity_per_rank():
+  """Return the exact receive capacity used by the process-local TE bootstrap."""
+  if _te_moe_bootstrap_signature is None:
+    raise RuntimeError("TE MoE EP has not been bootstrapped yet.")
+  return _te_moe_bootstrap_signature[5]
+
+
+def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
+  """Eagerly initialize TransformerEngine NCCL EP for the fused MoEBlock path."""
+  if not getattr(config, "te_moe_block", False):
+    return
+
+  if jax.local_device_count() != 1:
+    raise ValueError(
+        "te_moe_block=True requires one local device per process. Run MaxText with "
+        "`test-maxtext.sh --multiprocess` or an equivalent one-GPU-per-process launcher."
+    )
+
+  try:
+    from transformer_engine.jax.ep import ep_bootstrap  # pylint: disable=import-outside-toplevel
+    from transformer_engine.jax.moe import (  # pylint: disable=import-outside-toplevel
+        get_moe_recv_capacity_per_rank,
+        record_ep_bootstrap_signature_for_moe,
+    )
+  except ImportError as exc:
+    raise ImportError("te_moe_block=True requires TransformerEngine with JAX EP MoE support.") from exc
+
+  ep_axis = "expert"
+  fsdp_axis = "fsdp"
+  ep_size = mesh.shape.get(ep_axis, 1)
+  fsdp_size = mesh.shape.get(fsdp_axis, 1)
+
+  batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  if config.num_experts % ep_size != 0:
+    raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
+
+  max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
+  worst_case_recv_capacity_per_rank = get_moe_recv_capacity_per_rank(
+      num_experts=config.num_experts,
+      num_experts_per_tok=config.num_experts_per_tok,
+      max_tokens_per_rank=max_tokens_per_rank,
+      ep_size=ep_size,
+  )
+  recv_capacity_factor = config.te_ep_receive_capacity_factor
+  recv_capacity_per_rank = get_moe_recv_capacity_per_rank(
+      num_experts=config.num_experts,
+      num_experts_per_tok=config.num_experts_per_tok,
+      max_tokens_per_rank=max_tokens_per_rank,
+      ep_size=ep_size,
+      recv_capacity_factor=recv_capacity_factor,
+  )
+  drop_on_overflow = recv_capacity_per_rank < worst_case_recv_capacity_per_rank
+  hidden_dim = config.moe_expert_input_dim if config.moe_expert_input_dim > 0 else config.emb_dim
+
+  signature = (
+      jax.process_count(),
+      jax.process_index(),
+      ep_size,
+      config.num_experts,
+      max_tokens_per_rank,
+      recv_capacity_per_rank,
+      hidden_dim,
+      drop_on_overflow,
+  )
+  global _te_moe_bootstrap_signature
+  if _te_moe_bootstrap_signature == signature:
+    return
+  if _te_moe_bootstrap_signature is not None:
+    raise ValueError(
+        f"TE MoE EP was already bootstrapped with {_te_moe_bootstrap_signature}, " f"but this run needs {signature}."
+    )
+
+  with jax.set_mesh(mesh), mesh:
+    max_logging.log(
+        "Bootstrapping TE MoE EP: "
+        f"world={jax.process_count()} rank={jax.process_index()} ep={ep_size} "
+        f"num_experts={config.num_experts} max_tokens_per_rank={max_tokens_per_rank} "
+        f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim} "
+        f"recv_capacity_factor={recv_capacity_factor} drop_on_overflow={drop_on_overflow}"
+    )
+    ep_bootstrap(
+        world_size=jax.process_count(),
+        rank=jax.process_index(),
+        num_experts=config.num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
+        recv_capacity_per_rank=recv_capacity_per_rank,
+        hidden_dim=hidden_dim,
+        max_token_dtype=config.dtype,
+        drop_on_overflow=drop_on_overflow,
+    )
+    record_ep_bootstrap_signature_for_moe(
+        num_experts=config.num_experts,
+        max_tokens_per_rank=max_tokens_per_rank,
+        recv_capacity_per_rank=recv_capacity_per_rank,
+        hidden_dim=hidden_dim,
+        ep_size=ep_size,
+    )
+  _te_moe_bootstrap_signature = signature
 
 
 def maybe_pad(inputs, tile_size):

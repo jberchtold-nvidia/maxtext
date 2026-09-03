@@ -18,13 +18,14 @@
 # Calling jax.device_count here prevents a "TPU platform already registered" error.
 # See github.com/google/maxtext/issues/20 for more
 
-from typing import Any, Sequence
+from typing import Any, Sequence, TypedDict
 import datetime
 import functools
 import os
 
 from absl import app
 
+import numpy as np
 import optax
 
 import pathwaysutils  # pylint: disable=unused-import
@@ -49,6 +50,7 @@ from maxtext.configs.types import TeCommGemmOverlapPolicy
 from maxtext.diffusion.block_diffusion import target_alignment as block_diffusion_target_alignment
 from maxtext.utils.globals import EPS
 from maxtext.utils import elastic_utils
+
 # Placeholder: internal
 
 # pylint: disable=too-many-positional-arguments
@@ -78,6 +80,17 @@ from maxtext.utils import maxtext_utils_nnx
 from maxtext.utils import train_utils
 from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
 from maxtext.utils.vocabulary_tiling import vocab_tiling_linen_loss, vocab_tiling_nnx_loss
+
+
+class EncoderKwargs(TypedDict, total=False):
+  """Multimodal encoder arguments forwarded to the model."""
+
+  encoder_images: Any
+  encoder_image_masks: Any
+  encoder_videos: Any
+  encoder_video_masks: Any
+  encoder_video_grid_thw: Any
+
 
 VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 
@@ -134,6 +147,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   else:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
+  # Only forward the kwarg when router replay is actually in use, so models
+  # and adapters whose __call__ predates the feature keep working.
+  forced_routing_kwargs = (
+      {"forced_routed_experts": data["forced_routed_experts"]} if "forced_routed_experts" in data else {}
+  )
+
   if is_block_diffusion:
     targets_loss_mask = (data["targets_loss_mask"] != 0) & (data["targets_segmentation"] != 0)
     target_positions = data.get("targets_position", data["inputs_position"])
@@ -144,6 +163,19 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   # parameters in the model and checkpoints. Only pass image inputs when present.
   encoder_images = data.get("images") if config.use_multimodal else None
   encoder_image_masks = data.get("image_masks") if config.use_multimodal else None
+  is_video = "video_grid_thw" in data
+  encoder_kwargs: EncoderKwargs
+  if is_video:
+    encoder_kwargs = {
+        "encoder_videos": encoder_images,
+        "encoder_video_masks": encoder_image_masks,
+        "encoder_video_grid_thw": data.get("video_grid_thw"),
+    }
+  else:
+    encoder_kwargs = {
+        "encoder_images": encoder_images,
+        "encoder_image_masks": encoder_image_masks,
+    }
   mutable_collections = ["intermediates"]
   if config.mtp_num_layers > 0 and is_train:
     # The single model.apply call now triggers the entire chain if MTP is enabled:
@@ -179,13 +211,13 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         data["inputs"],
         data["inputs_position"],
         decoder_segment_ids=data["inputs_segmentation"],
-        encoder_images=encoder_images,
-        encoder_image_masks=encoder_image_masks,
+        **encoder_kwargs,
         enable_dropout=config.enable_dropout if is_train else False,
         rngs={"dropout": rng1, "params": aqt_rng},  # pyrefly: ignore[bad-argument-type]
         mutable=mutable_collections,
         decoder_target_tokens=data["targets"],
         decoder_target_mask=data["targets_segmentation"],
+        **forced_routing_kwargs,
     )
 
     if (config.use_indexer and not config.indexer_sparse_training) and is_train:
@@ -238,11 +270,11 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         decoder_input_tokens=data["inputs"],
         decoder_positions=data["inputs_position"],
         decoder_segment_ids=data["inputs_segmentation"],
-        encoder_images=encoder_images,
-        encoder_image_masks=encoder_image_masks,
+        **encoder_kwargs,
         enable_dropout=config.enable_dropout if is_train else False,
         decoder_target_tokens=data["targets"],
         decoder_target_mask=data["targets_segmentation"],
+        **forced_routing_kwargs,
     )
     # mtp_losses and mtp_acceptance subclass nnx.Intermediate, and nnx type filters match
     # subclasses. Pop them before the generic Intermediate pop below, which would otherwise
@@ -389,6 +421,14 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
             mtp_moe_bias_updates = []
           mtp_moe_bias_updates.append(val)
 
+  te_moe_block = getattr(config, "te_moe_block", False)
+  if te_moe_block:
+    overflow_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "te_moe_capacity_overflow")
+    total_recv_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "te_moe_total_recv_tokens")
+    capacity_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "te_moe_recv_capacity_per_rank")
+    if not overflow_values or not total_recv_values or not capacity_values:
+      raise ValueError("te_moe_block=True did not produce TE MoE receive-capacity intermediates.")
+
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
   if not is_train and config.mtp_eval_target_module > 0:
@@ -406,6 +446,14 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "mtp_loss": mtp_loss,
       "batch_stats": (intermediate_outputs.get("batch_stats", None) if hasattr(intermediate_outputs, "get") else None),
   }
+  if te_moe_block:
+    aux.update(
+        {
+            "te_moe_capacity_overflow": jnp.any(jnp.concatenate(overflow_values)),
+            "te_moe_max_total_recv_tokens": jnp.max(jnp.concatenate(total_recv_values)),
+            "te_moe_recv_capacity_per_rank": jnp.min(jnp.concatenate(capacity_values)),
+        }
+    )
   return loss, aux
 
 
@@ -677,7 +725,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         decoder_layer = getattr(new_state.model.decoder, "moe_layers", new_state.model.decoder)
         decoder_bias = _find_gate_bias(decoder_layer)
         if decoder_bias is not None:
-          decoder_bias.value = decoder_bias.value + jnp.array(moe_bias_updates[0]).transpose()
+          decoder_bias.value = decoder_bias.value + jnp.array(moe_bias_updates[0])
 
         # 2. Update auxiliary MTP MoE layers (if enabled).
         # Unlike the main decoder, each MTP layer is an individual un-scanned layer
@@ -700,6 +748,14 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
   }
+  if getattr(config, "te_moe_block", False):
+    scalar_metrics.update(
+        {
+            "learning/te_moe_capacity_overflow": aux["te_moe_capacity_overflow"].astype(jnp.int32),
+            "learning/te_moe_max_total_recv_tokens": aux["te_moe_max_total_recv_tokens"],
+            "learning/te_moe_recv_capacity_per_rank": aux["te_moe_recv_capacity_per_rank"],
+        }
+    )
   scalar_metrics.update(bias_metrics)
   if config.use_qk_clip:
     if isinstance(model, nn.Module):
@@ -907,6 +963,7 @@ def training_loop_iteration(
   # Pack mutated state back to dicts
   jax_device_state["state"] = state
   python_vars["last_step_completion"] = last_step_completion
+  return metrics
 
 
 def train_loop(config, recorder, state=None):
@@ -959,7 +1016,10 @@ def train_loop(config, recorder, state=None):
       params_shardings,
   )
 
-  with jax.set_mesh(mesh), mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+  # Do not enter the legacy `mesh` context manager here: the training loop calls
+  # p_train_step without it, and the mismatch in jit's tracing-cache key would
+  # cause train_step to be traced and compiled a second time on the first step.
+  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
     data_sharding = sharding.get_input_data_sharding(config, mesh)
     shaped_batch = maxtext_utils.get_shaped_batch(config, batch_sharding=data_sharding)
     if config.shard_optimizer_over_data and isinstance(model, nn.Module):
@@ -973,7 +1033,12 @@ def train_loop(config, recorder, state=None):
     else:
       lower_args = (state, shaped_batch)
     maxtext_utils.maybe_dump_jaxpr(config, p_train_step, lower_args)
-    if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
+    if config.compiled_trainstep_file == "" and not jax.config.jax_enable_pgle:
+      # Compile only when there is no pre-compiled file loaded. With AutoPGLE, an
+      # ahead-of-time compiled executable can never be reused by the dispatch path
+      # (the active PGLE profiler is part of JAX's executable cache key), so this
+      # compile would only add a third full compilation on top of the profiling
+      # compile and the FDO recompile; skip it and its memory stats.
       compiler_options = max_utils.parse_libtpu_flags_to_dict(config.compile_xla_flags)
       compiled = p_train_step.lower(*lower_args).compile(compiler_options=compiler_options)
       compiled_stats = compiled.memory_analysis()
@@ -1038,13 +1103,52 @@ def train_loop(config, recorder, state=None):
   }
 
   _job_completed_gracefully = False
+  te_moe_overflow_window = []
   try:
     python_vars["last_step_completion"] = datetime.datetime.now()
 
     # Using while loop to allow for potential dynamic 'steps' adjustment in future
     while python_vars["step"] < immutable_data["steps"]:
-      training_loop_iteration(jax_device_state, python_vars, immutable_data)
+      step = python_vars["step"]
+      metrics = training_loop_iteration(jax_device_state, python_vars, immutable_data)
       python_vars["step"] += 1
+
+      if getattr(config, "te_moe_block", False):
+        te_moe_overflow_window.append(
+            (
+                int(step),
+                metrics["scalar"]["learning/te_moe_capacity_overflow"],
+                metrics["scalar"]["learning/te_moe_max_total_recv_tokens"],
+                metrics["scalar"]["learning/te_moe_recv_capacity_per_rank"],
+            )
+        )
+        check_overflow = (
+            len(te_moe_overflow_window) == config.te_ep_overflow_check_every_n_steps or step == config.steps - 1
+        )
+        if check_overflow:
+          checked_window = jax.device_get(tuple(te_moe_overflow_window))
+          overflowing_steps = [entry for entry in checked_window if bool(np.asarray(entry[1]))]
+          te_moe_overflow_window.clear()
+        else:
+          overflowing_steps = []
+
+        if overflowing_steps:
+          overflow_step = overflowing_steps[0][0]
+          observed = max(int(np.asarray(entry[2])) for entry in overflowing_steps)
+          capacity = min(int(np.asarray(entry[3])) for entry in overflowing_steps)
+          prof.deactivate()
+          message = (
+              "TE MoE receive capacity overflow at training step "
+              f"{overflow_step} (detected at the {config.te_ep_overflow_check_every_n_steps}-step "
+              f"check ending at step {step}): "
+              f"observed padded receive demand {observed} exceeds "
+              f"recv_capacity_per_rank {capacity} "
+              f"(te_ep_receive_capacity_factor={config.te_ep_receive_capacity_factor}). "
+              "The optimizer update was skipped; increase te_ep_receive_capacity_factor, "
+              "or set it to null to reserve worst-case dropless capacity."
+          )
+          max_logging.error(message)
+          raise RuntimeError(message)
 
     # Unpack state for post-loop actions
     state = jax_device_state["state"]
