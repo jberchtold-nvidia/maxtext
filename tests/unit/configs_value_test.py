@@ -96,6 +96,80 @@ class ConfigTest(absltest.TestCase):
     with self.assertRaises(pydantic.ValidationError):
       pyconfig.initialize(argv)
 
+  def test_te_moe_block_rejects_unsupported_options_during_config_validation(self):
+    common_config = {
+        "run_name": "test",
+        "num_experts": 2,
+        "base_moe_mlp_dim": 7168,
+        "first_num_dense_layers": 1,
+        "sparse_matmul": True,
+        "prefuse_moe_weights": True,
+        "te_moe_block": True,
+        "te_gmm_quantization": "te_no_quant",
+        # Prevent the general EP validation from masking the more specific
+        # te_moe_block/use_random_routing incompatibility under test.
+        "override_logical_axis_rules": True,
+    }
+    invalid_configs = (
+        ({"norm_topk_prob": True}, "te_moe_block=True does not currently support norm_topk_prob=True."),
+        ({"use_random_routing": True}, "te_moe_block=True does not support use_random_routing=True."),
+        (
+            {"decoder_block": types.DecoderBlockType.LLAMA4},
+            "te_moe_block=True does not currently support Llama4 routing semantics.",
+        ),
+        (
+            {"te_gmm_quantization": ""},
+            "te_gmm_quantization must be specified when te_moe_block=True.",
+        ),
+    )
+
+    for overrides, expected_error in invalid_configs:
+      with self.subTest(overrides=overrides):
+        with self.assertRaises(pydantic.ValidationError) as context:
+          types.MaxTextConfig(**{**common_config, **overrides})
+        self.assertIn(expected_error, str(context.exception))
+
+  def test_te_moe_block_uses_ragged_buffer_factor_validation(self):
+    common_config = {
+        "run_name": "test",
+        "num_experts": 2,
+        "base_moe_mlp_dim": 7168,
+        "first_num_dense_layers": 1,
+        "sparse_matmul": True,
+        "prefuse_moe_weights": True,
+        "te_moe_block": True,
+        "te_gmm_quantization": "te_no_quant",
+    }
+
+    # TE accepts the native worst-case sentinel and a finite factor even when
+    # EP is not enabled in the MaxText logical rules.
+    for factor in (-1.0, 0.0, 1.0, 1.5):
+      with self.subTest(factor=factor):
+        config = types.MaxTextConfig(**common_config, ragged_buffer_factor=factor)
+        self.assertEqual(config.ragged_buffer_factor, factor)
+
+    with self.assertRaises(pydantic.ValidationError) as context:
+      types.MaxTextConfig(**common_config, ragged_buffer_factor=0.5)
+    self.assertIn("te_moe_block=True requires ragged_buffer_factor >= 1.0", str(context.exception))
+
+    # Native ring-of-experts keeps its existing ragged-sort restriction, while
+    # TE MoEBlock bypasses that native implementation and its validation.
+    native_ring_config = {
+        **common_config,
+        "te_moe_block": False,
+        "te_gmm_quantization": "",
+        "override_logical_axis_rules": True,
+        "use_ring_of_experts": True,
+        "ragged_buffer_factor": 1.5,
+    }
+    with self.assertRaises(pydantic.ValidationError) as context:
+      types.MaxTextConfig(**native_ring_config)
+    self.assertIn("Ragged buffer factor is currently only supported with", str(context.exception))
+
+    te_ring_config = {**native_ring_config, "te_moe_block": True, "te_gmm_quantization": "te_no_quant"}
+    config = types.MaxTextConfig(**te_ring_config)
+    self.assertEqual(config.ragged_buffer_factor, 1.5)
+
   def test_tpu_tokamax_ring_config_validation_accepts_initial_config(self):
     argv = [
         "",
@@ -236,6 +310,30 @@ class ConfigTest(absltest.TestCase):
 
     self.assertTrue(config.use_indexer)
     self.assertEqual(config.attention_type, "mla")
+
+  def test_indexer_all_gather_context_parallelism_rejects_attention_sink(self):
+    argv = [
+        "",
+        _BASE_CONFIG_PATH,
+        "run_name=test",
+        "attention=flash",
+        "attention_type=mla",
+        "use_indexer=True",
+        "q_lora_rank=1",
+        "attention_sink=True",
+        "use_tokamax_splash=True",
+        "use_jax_splash=False",
+        "context_parallel_strategy=all_gather",
+        "ici_context_parallelism=2",
+        "hardware=tpu",
+        "packing=False",
+        "dataset_type=synthetic",
+        "skip_jax_distributed_system=True",
+    ]
+    mock_devices = [unittest.mock.MagicMock(slice_index=0) for _ in range(8)]
+    with unittest.mock.patch("jax.devices", return_value=mock_devices):
+      with self.assertRaisesRegex(ValueError, "does not support attention sinks"):
+        pyconfig.initialize(argv)
 
   def test_tpu_tokamax_ring_config_validation_rejects_unsupported_configs(self):
     base_args = [
@@ -897,6 +995,22 @@ class ConfigTest(absltest.TestCase):
     ]
     with self.assertRaises(pydantic.ValidationError):
       pyconfig.initialize(argv)
+
+
+class MMapDatasetConfigTest(absltest.TestCase):
+  """Tests for mmap-specific configuration defaults and accepted values."""
+
+  def test_default_is_25_preserving_prior_behavior(self):
+    config = types.MMapDataset()
+    self.assertEqual(config.packing_max_segments_per_sample, 25)
+
+  def test_custom_value_is_accepted(self):
+    config = types.MMapDataset(packing_max_segments_per_sample=64)
+    self.assertEqual(config.packing_max_segments_per_sample, 64)
+
+  def test_zero_disables_merging_round_trip(self):
+    config = types.MMapDataset(packing_max_segments_per_sample=0)
+    self.assertEqual(config.packing_max_segments_per_sample, 0)
 
 
 if __name__ == "__main__":

@@ -115,13 +115,28 @@ MaxText implements an exact, paper-aligned version of DeepSeek V4's load balanci
 
 `use_batch_split_schedule` (experimental): If enabled, split batch into micro-batches to hide communications that yields performance benefits.
 
+#### TransformerEngine MoEBlock
+
+`te_moe_block`: If enabled, uses TransformerEngine's fused expert-parallel MoEBlock for routing, dispatch, grouped GEMMs, and combining expert outputs. It requires `sparse_matmul=True`, `prefuse_moe_weights=True`, and TransformerEngine JAX with expert-parallel MoE support (TE 2.19+).
+
+`te_gmm_quantization`: Selects the quantization mode for TransformerEngine grouped GEMMs. This must be set when `te_moe_block=True`. Available options are:
+
+- `te_no_quant`: Uses the model's default precision, such as BF16, without quantization.
+- `te_mxfp8`: Uses MXFP8 quantization.
+
+`te_ep_overflow_check_every_n_steps`: Sets the number of training steps between host-side checks of buffered receive-capacity overflow results when `ragged_buffer_factor` limits TransformerEngine's receive capacity. An overflowing step skips its optimizer update immediately on device. At the next check, training raises an error that reports the observed demand and configured capacity. The default is `20`.
+
 ## 2. Sharding
 
 `use_ring_of_experts` (experimental): This feature requires expert parallelism. If enabled, it replaces the standard two All-to-All communications with All-Gather in dispatch and Reduce-Scatter in collect. By gathering inputs across all shards, it allows for local routing and Top-K calculations, followed by result aggregation via Reduce-Scatter. This approach is particularly effective for models with a large Top-K, as it gathers activations before they are replicated k times to reduce communication.
 
 `moe_fsdp_use_two_stage_all_gather`: If enabled, split the All-Gather operation for MoE weights into two separate stages when using FSDP/FSDP-transpose sharding. This is preferred when 3D All-Gather support is unavailable.
 
-`shard_exp_on_fsdp`: If enabled, shard the expert dimension of the MLP weights on the FSDP axis, and recommended only when num_experts is a multiple of fsdp_parallelism.
+**MoE FSDP Sharding Strategies** (Note: At most one of the following three flags can be enabled at a time):
+
+- `shard_exp_on_fsdp`: If enabled, shard the expert dimension of the MLP weights on the FSDP axis. Works for both unquantized and quantized. When `quantization` and `weight_quantization_calibration_method` are fixed, it performs quantized weight all gather over fsdp before gmm. This is recommended only when `num_experts` is a multiple of `fsdp_parallelism`.
+- `use_2d_fsdp_sharding`: If enabled, use fsdp and fsdp_transpose axes for sharding the MoE weights.
+- `shard_embed_moe_on_fsdp`: If enabled, keep embed_moe sharded so we can manually QAG (Quantize-All-Gather) it over FSDP. Requires `quantization` to be specified and `weight_quantization_calibration_method` to be fixed.
 
 ## 3. Performance Tuning
 
