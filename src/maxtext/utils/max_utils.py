@@ -283,11 +283,31 @@ def maybe_initialize_jax_distributed_system(raw_keys):
   # Initialization for gpu_multiprocess hardware
   if raw_keys["hardware"] == "gpu_multiprocess":
     max_logging.log("Attempting to initialize the jax distributed system for gpu_multiprocess hardware...")
+    coordinator_address = os.getenv("MAXTEXT_JAX_COORDINATOR_ADDRESS")
+    process_count = os.getenv("JAX_PROCESS_COUNT")
+    process_index = os.getenv("JAX_PROCESS_INDEX")
+    local_device_ids = os.getenv("JAX_LOCAL_DEVICE_IDS")
+    explicit_local_launch = all(
+        value is not None
+        for value in (coordinator_address, process_count, process_index, local_device_ids)
+    )
+    init_kwargs = {}
+    if explicit_local_launch:
+      init_kwargs = {
+          "coordinator_address": coordinator_address,
+          "num_processes": int(process_count),
+          "process_id": int(process_index),
+          "local_device_ids": [int(device_id) for device_id in local_device_ids.split(",")],
+      }
     if not raw_keys["enable_emergency_checkpoint"]:
-      jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+      jax.distributed.initialize(
+          initialization_timeout=raw_keys["jax_distributed_initialization_timeout"], **init_kwargs
+      )
     else:
       max_logging.log("Initializing jax distributed to support local checkpointing with GPUs...")
-      jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+      jax.distributed.initialize(
+          initialization_timeout=raw_keys["jax_distributed_initialization_timeout"], **init_kwargs
+      )
       ocp.multihost.initialize_runtime_to_distributed_ids()
       ocp.multihost.initialize_distributed_to_device_ids()
       max_logging.log("Jax distributed system initialized!")

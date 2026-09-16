@@ -1038,6 +1038,13 @@ def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any]:
   # TODO: mazumdera@ : ensure missing mandatory fields in base.yml are filled in in argv,
   # or fill in here
   config = pyconfig.initialize(argv)
+  if config.enable_fsdp_all_gather_overlap:
+    from maxtext.utils import fsdp_all_gather_overlap  # pylint: disable=import-outside-toplevel
+
+    fsdp_all_gather_overlap.register_fsdp_all_gather_overlap_pass(
+        config.fsdp_all_gather_overlap_max_hoist,
+        config.fsdp_all_gather_overlap_max_original_window,
+    )
   max_utils.print_system_information()
   train_utils.validate_train_config(config)
   jax.config.update("jax_use_shardy_partitioner", config.shardy)

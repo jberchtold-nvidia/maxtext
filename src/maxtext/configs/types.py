@@ -2415,6 +2415,20 @@ class Profiling(BaseModel):
   """Configuration for performance profiling."""
 
   profiler: ProfilerType = Field(ProfilerType.NONE, description="Profiler to use ('xplane', 'nsys').")
+  enable_fsdp_all_gather_overlap: bool = Field(
+      False,
+      description="Hoist FSDP all-gather launches after XLA scheduling to overlap communication with independent compute.",
+  )
+  fsdp_all_gather_overlap_max_hoist: int = Field(
+      128,
+      ge=0,
+      description="Maximum scheduled instructions by which to hoist an FSDP all-gather start.",
+  )
+  fsdp_all_gather_overlap_max_original_window: int = Field(
+      32,
+      ge=1,
+      description="Only hoist FSDP gathers whose original start-to-done schedule window is at most this size.",
+  )
   upload_all_profiler_results: bool = Field(False, description="Upload profiler results from all hosts.")
   skip_first_n_steps_for_profiler: int = Field(1, description="Number of initial steps to skip for profiling.")
   profiler_steps: int = Field(5, description="Number of steps to profile.")

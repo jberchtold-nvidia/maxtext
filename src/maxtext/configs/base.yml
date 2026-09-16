@@ -922,6 +922,10 @@ autoregressive_decode_assert: ""
 # For nsys profiler, pass the training command to nsys command
 # e.g. nsys profile -s none --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop {training command}
 profiler: "" # Supported profiler: '', xplane, nsys
+# Post-scheduling HLO pass that hoists FSDP all-gather launches over independent compute.
+enable_fsdp_all_gather_overlap: false
+fsdp_all_gather_overlap_max_hoist: 128
+fsdp_all_gather_overlap_max_original_window: 32
 # If set to true, upload all profiler results from all hosts. Otherwise, only upload the profiler result from the first host.
 upload_all_profiler_results: false
 # Skip first n steps for profiling, to omit things like compilation and to give
