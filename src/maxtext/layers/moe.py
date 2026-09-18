@@ -19,6 +19,7 @@ import dataclasses
 import enum
 import functools
 import math
+import os
 import random
 from typing import Iterable, Optional, Tuple, Union
 
@@ -69,6 +70,32 @@ COMBINE = "combine"
 WI_0 = "wi_0"
 WI_1 = "wi_1"
 WO = "wo"
+
+_CUDNN_GROUPED_GEMM_FUSION_ENV = "NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION"
+
+
+def _use_cudnn_native_moe_weight_layout() -> bool:
+  """Whether TE's cuDNN grouped-SwiGLU path owns wi in native [E,2N,K] layout."""
+  value = os.getenv(_CUDNN_GROUPED_GEMM_FUSION_ENV, "0")
+  if value not in ("0", "1"):
+    raise ValueError(f"{_CUDNN_GROUPED_GEMM_FUSION_ENV} must be '0' or '1', got {value!r}")
+  return value == "1"
+
+
+def _to_cudnn_native_moe_weight_layout(wi: jax.Array) -> jax.Array:
+  """Convert [E,K,gate_then_up] to block-interleaved [E,2N,K] once at init."""
+  if wi.ndim != 3 or wi.shape[-1] % 64:
+    raise ValueError(f"Expected [E,K,2N] wi with 64-aligned 2N, got {wi.shape}")
+  gate, up = jnp.split(wi, 2, axis=-1)
+  blocks = gate.shape[-1] // 32
+  interleaved = jnp.stack(
+      (
+          gate.reshape(gate.shape[0], gate.shape[1], blocks, 32),
+          up.reshape(up.shape[0], up.shape[1], blocks, 32),
+      ),
+      axis=-2,
+  ).reshape(wi.shape)
+  return interleaved.transpose(0, 2, 1)
 
 
 @struct.dataclass
@@ -607,6 +634,18 @@ class RoutedMoE(nnx.Module):
       self.wi_kernel_axes = ("exp", "embed_moe", "mlp_moe")
       self.wo_kernel_axes = ("exp", "mlp_moe", "embed_moe")
 
+    self.cudnn_native_wi_layout = (
+        self.config.te_moe_block and _use_cudnn_native_moe_weight_layout()
+    )
+    if self.cudnn_native_wi_layout:
+      # Persistent cuDNN layout is [E,2N,K], so its logical axes follow the
+      # physical transpose of MaxText's conventional [E,K,2N] parameter.
+      self.wi_kernel_axes = (
+          self.wi_kernel_axes[0],
+          self.wi_kernel_axes[2],
+          self.wi_kernel_axes[1],
+      )
+
     if self.config.attention in ("vllm_rpa", "vllm_batched_rpa"):
       # vLLM uses 'model' as the tensor parallelism axis name
       self._tensor_parallelism_name = ("model", "attn_dp")
@@ -699,14 +738,17 @@ class RoutedMoE(nnx.Module):
       self.wi_1 = jnp.zeros((num_experts, self.moe_expert_input_dim, intermediate_dim))
       self.wo = jnp.zeros((num_experts, intermediate_dim, self.moe_expert_input_dim))
     elif self.config.prefuse_moe_weights:
+      wi = self.kernel_init(
+          self.rngs.params(),
+          (num_experts, self.moe_expert_input_dim, moe_intermediate_dim * 2),
+          weight_dtype,
+          kernel_in_axis,
+          kernel_out_axis,
+      )
+      if self.cudnn_native_wi_layout:
+        wi = _to_cudnn_native_moe_weight_layout(wi)
       self.wi = nnx.Param(
-          self.kernel_init(
-              self.rngs.params(),
-              (num_experts, self.moe_expert_input_dim, moe_intermediate_dim * 2),
-              weight_dtype,
-              kernel_in_axis,
-              kernel_out_axis,
-          ),
+          wi,
           out_sharding=self.wi_kernel_axes,
       )
       self.wo = nnx.Param(
