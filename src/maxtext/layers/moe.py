@@ -628,12 +628,13 @@ class RoutedMoE(nnx.Module):
           else (self._expert_parallelism_name,)
       )
       self._te_ep_axes = (*base_ep_axes, "tensor")
-      # TE's grouped GEMMs consume one complete expert kernel per compound
-      # EP rank. Store routed-expert weights in that layout so XLA does not
-      # gather FSDP/TP shards, transpose them, and repartition the expert axis
-      # on every invocation.
-      self.wi_kernel_axes = (self._te_ep_axes, None, None)
-      self.wo_kernel_axes = (self._te_ep_axes, None, None)
+      # Tensor parallelism participates in TE's compound expert axis, while
+      # FSDP retains its original placement on a matrix dimension. TE gathers
+      # that FSDP shard when each grouped GEMM needs its complete local expert
+      # kernels. Keep the logical embed_moe name here so both parameter setup
+      # and TE's backward constraints resolve it to the physical fsdp axis.
+      self.wi_kernel_axes = (self._te_ep_axes, "embed_moe", None)
+      self.wo_kernel_axes = (self._te_ep_axes, None, "embed_moe")
     else:
       self._te_ep_axes = None
 
@@ -778,7 +779,7 @@ class RoutedMoE(nnx.Module):
     if self.config.mlp_bias:
       if self.config.te_moe_block:
         wi_bias_axes = (self._te_ep_axes, None)
-        wo_bias_axes = (self._te_ep_axes, None)
+        wo_bias_axes = (self._te_ep_axes, "embed_moe")
       else:
         wi_bias_axes = ("exp", "activation_mlp")
         wo_bias_axes = ("exp", "activation_embed")

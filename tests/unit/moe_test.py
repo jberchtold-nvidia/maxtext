@@ -2447,11 +2447,18 @@ class RoutedMoETeWeightShardingTest(unittest.TestCase):
     mesh = Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
     model = make_moe(cfg, mesh, intermediate_dim=cfg.base_moe_mlp_dim)
 
-    expected = (("expert", "tensor"), None, None)
-    self.assertEqual(model.wi_kernel_axes, expected)
-    self.assertEqual(model.wo_kernel_axes, expected)
-    self.assertEqual(model.wi.get_metadata()["out_sharding"], expected)
-    self.assertEqual(model.wo.get_metadata()["out_sharding"], expected)
+    expected_wi = (("expert", "tensor"), "embed_moe", None)
+    expected_wo = (("expert", "tensor"), None, "embed_moe")
+    self.assertEqual(model.wi_kernel_axes, expected_wi)
+    self.assertEqual(model.wo_kernel_axes, expected_wo)
+    self.assertEqual(model.wi.get_metadata()["out_sharding"], expected_wi)
+    self.assertEqual(model.wo.get_metadata()["out_sharding"], expected_wo)
+    physical_wi_candidates = nn.logical_to_mesh_axes(expected_wi, rules=cfg.logical_axis_rules)
+    physical_wo_candidates = nn.logical_to_mesh_axes(expected_wo, rules=cfg.logical_axis_rules)
+    self.assertEqual(physical_wi_candidates[0], ("expert", "tensor"))
+    self.assertIn("fsdp", physical_wi_candidates[1])
+    self.assertEqual(physical_wo_candidates[0], ("expert", "tensor"))
+    self.assertIn("fsdp", physical_wo_candidates[2])
 
 
 @pytest.mark.tpu_only

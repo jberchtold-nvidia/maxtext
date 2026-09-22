@@ -448,14 +448,20 @@ class TestAssertParamsSufficientlySharded(unittest.TestCase):
     # Assert that the parameters are sufficiently sharded; this should pass with no error.
     assert_params_sufficiently_sharded(params, self.mesh, tolerance=0.1)
 
-  def test_compound_ep_weight_may_replicate_over_fsdp(self):
-    """TE MoE weights intentionally replicate compound-EP experts over FSDP."""
+  def test_compound_ep_weight_requires_fsdp_sharding(self):
+    """Compound-EP weights must not silently replicate over FSDP."""
     if len(jax.devices()) < 8:
       self.skipTest("This test requires 8 devices.")
     mesh = Mesh(np.array(jax.devices()[:8]).reshape((2, 2, 2)), ("fsdp", "expert", "tensor"))
-    pspec = PartitionSpec(("expert", "tensor"), None, None)
-    params = {"moe_weight": jax.device_put(jnp.ones((8, 4, 4)), NamedSharding(mesh, pspec))}
+    replicated_over_fsdp = PartitionSpec(("expert", "tensor"), None, None)
+    params = {
+        "moe_weight": jax.device_put(jnp.ones((8, 4, 4)), NamedSharding(mesh, replicated_over_fsdp))
+    }
+    with self.assertRaises(AssertionError):
+      assert_params_sufficiently_sharded(params, mesh, tolerance=0.0)
 
+    sharded_over_fsdp = PartitionSpec(("expert", "tensor"), "fsdp", None)
+    params = {"moe_weight": jax.device_put(jnp.ones((8, 4, 4)), NamedSharding(mesh, sharded_over_fsdp))}
     assert_params_sufficiently_sharded(params, mesh, tolerance=0.0)
 
   def test_unsharded_fails(self):
