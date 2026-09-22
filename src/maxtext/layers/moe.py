@@ -621,6 +621,22 @@ class RoutedMoE(nnx.Module):
     else:
       self._expert_parallelism_name = "expert"
 
+    if self.config.te_moe_block:
+      base_ep_axes = (
+          self._expert_parallelism_name
+          if isinstance(self._expert_parallelism_name, tuple)
+          else (self._expert_parallelism_name,)
+      )
+      self._te_ep_axes = (*base_ep_axes, "tensor")
+      # TE's grouped GEMMs consume one complete expert kernel per compound
+      # EP rank. Store routed-expert weights in that layout so XLA does not
+      # gather FSDP/TP shards, transpose them, and repartition the expert axis
+      # on every invocation.
+      self.wi_kernel_axes = (self._te_ep_axes, None, None)
+      self.wo_kernel_axes = (self._te_ep_axes, None, None)
+    else:
+      self._te_ep_axes = None
+
     if isinstance(self.quant, (quantizations.Fp8Quantization, quantizations.NANOOFp8Quantization)):
       einsum_names = [WI_0, WI_1, WO]
       if self.config.capacity_factor > 0:
@@ -760,8 +776,12 @@ class RoutedMoE(nnx.Module):
       )
 
     if self.config.mlp_bias:
-      wi_bias_axes = ("exp", "activation_mlp")
-      wo_bias_axes = ("exp", "activation_embed")
+      if self.config.te_moe_block:
+        wi_bias_axes = (self._te_ep_axes, None)
+        wo_bias_axes = (self._te_ep_axes, None)
+      else:
+        wi_bias_axes = ("exp", "activation_mlp")
+        wo_bias_axes = ("exp", "activation_embed")
       wi_bias_shape = (self.num_experts, self.intermediate_dim)
       wo_bias_shape = (self.num_experts, self.moe_expert_input_dim)
       self.wi_0_bias = nnx.Param(
@@ -3778,7 +3798,7 @@ class RoutedMoE(nnx.Module):
           f"MaxText's TE MoEBlock path expects [batch, sequence, hidden], got {inputs.shape}."
       )
 
-    ep_axes = (self._expert_parallelism_name, "tensor")
+    ep_axes = self._te_ep_axes
     fsdp_size = self.mesh.shape.get("fsdp", 1)
     ep_size = math.prod(self.mesh.shape.get(axis, 1) for axis in ep_axes)
     if self.num_experts % ep_size != 0:

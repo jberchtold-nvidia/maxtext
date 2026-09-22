@@ -2421,6 +2421,39 @@ def copy_weights_prefused(src_model, dst_model):
   dst_model.gate = src_model.gate
 
 
+class RoutedMoETeWeightShardingTest(unittest.TestCase):
+  """TE routed-expert parameters are stored in their compound-EP layout."""
+
+  def test_compound_ep_weight_storage_axes(self):
+    cfg = pyconfig.initialize(
+        [None, get_test_config_path()],
+        run_name="te_moe_weight_sharding_test",
+        enable_checkpointing=False,
+        model_name="mixtral-8x7b",
+        override_model_config=True,
+        base_emb_dim=128,
+        base_mlp_dim=64,
+        base_moe_mlp_dim=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        prefuse_moe_weights=True,
+        sparse_matmul=True,
+        megablox=False,
+        te_moe_block=True,
+        te_gmm_quantization="te_no_quant",
+        per_device_batch_size=1,
+        max_target_length=8,
+    )
+    mesh = Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
+    model = make_moe(cfg, mesh, intermediate_dim=cfg.base_moe_mlp_dim)
+
+    expected = (("expert", "tensor"), None, None)
+    self.assertEqual(model.wi_kernel_axes, expected)
+    self.assertEqual(model.wo_kernel_axes, expected)
+    self.assertEqual(model.wi.get_metadata()["out_sharding"], expected)
+    self.assertEqual(model.wo.get_metadata()["out_sharding"], expected)
+
+
 @pytest.mark.tpu_only
 @pytest.mark.post_training
 class FusedMoeTPUTest(unittest.TestCase):

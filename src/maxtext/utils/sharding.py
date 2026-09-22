@@ -539,13 +539,25 @@ def _analyze_sharding(params, mesh, valid_target_mesh_axes):
     current_sharding_spec = spec  # Extract the current tensor's sharding spec
     # Identify axes used for sharding
     mesh_axes_used = get_mesh_axes_used_by_tensor_spec(current_sharding_spec)
+    # TE MoE deliberately stores each routed expert wholly on one compound
+    # expert+tensor rank. FSDP replicas consume disjoint token shards but the
+    # same local expert weights, so replication over fsdp is intentional.
+    compound_ep_weight = any(
+        isinstance(dim_axes, Iterable)
+        and not isinstance(dim_axes, str)
+        and {"expert", "tensor"}.issubset(set(dim_axes))
+        for dim_axes in current_sharding_spec
+    )
+    required_mesh_axes = set(valid_target_mesh_axes)
+    if compound_ep_weight:
+      required_mesh_axes.discard("fsdp")
     # Check if the parameter is sharded on all the valid target axes.
-    is_sharded_on_all_target_axis = all(axis in mesh_axes_used for axis in valid_target_mesh_axes)
+    is_sharded_on_all_target_axis = all(axis in mesh_axes_used for axis in required_mesh_axes)
 
     # If the parameter is not sharded on all of the target axes, it's considered "problematic."
     if not is_sharded_on_all_target_axis:
       unsharded_params_total_size += p_leaf.size  # Add to total unsharded parameter size
-      unsharded_axes = set(valid_target_mesh_axes) - set(mesh_axes_used)
+      unsharded_axes = required_mesh_axes - set(mesh_axes_used)
       # Add detailed info to list of problematic tensors
       problematic_tensors_details.append(
           {
