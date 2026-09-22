@@ -89,6 +89,25 @@ class ConfigTest(absltest.TestCase):
     # num_devices is mocked to 8
     self.assertEqual(config.global_batch_size_to_train_on, 8 * 8 * 2)
 
+  def test_fractional_per_device_batch_size(self):
+    """A 0.5 device batch on eight devices produces global batch four."""
+    argv = [
+        "",
+        _BASE_CONFIG_PATH,
+        "run_name=test",
+        "per_device_batch_size=0.5",
+        "gradient_accumulation_steps=1",
+    ]
+    mock_devices = [unittest.mock.MagicMock(slice_index=0) for _ in range(8)]
+    with unittest.mock.patch("jax.devices", return_value=mock_devices):
+      config = pyconfig.initialize(argv)
+
+    # The loader still obtains one example per device; training selects the
+    # requested four-example microbatch before applying model sharding.
+    self.assertEqual(config.global_batch_size_to_load, 8)
+    self.assertEqual(config.micro_batch_size_to_train_on, 4)
+    self.assertEqual(config.global_batch_size_to_train_on, 4)
+
   def test_validation_error(self):
     """Tests that a validation error is raised for invalid config."""
     # A negative number for steps should trigger a ValidationError in the pydantic model.

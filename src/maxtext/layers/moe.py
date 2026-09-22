@@ -3757,7 +3757,7 @@ class RoutedMoE(nnx.Module):
       wo_bias: jax.Array | None,
       out_sharding: NamedSharding | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
-    """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params."""
+    """Run TransformerEngine's fused EP MoEBlock using a flattened token input."""
     try:
       from transformer_engine.jax import moe as te_moe  # pylint: disable=import-outside-toplevel
     except ImportError as exc:
@@ -3773,10 +3773,31 @@ class RoutedMoE(nnx.Module):
     if self.config.routed_bias:
       expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32)
 
+    if inputs.ndim != 3:
+      raise ValueError(
+          f"MaxText's TE MoEBlock path expects [batch, sequence, hidden], got {inputs.shape}."
+      )
+
+    ep_axes = (self._expert_parallelism_name, "tensor")
     fsdp_size = self.mesh.shape.get("fsdp", 1)
-    ep_size = self.mesh.shape.get(self._expert_parallelism_name, 1)
+    ep_size = math.prod(self.mesh.shape.get(axis, 1) for axis in ep_axes)
     if self.num_experts % ep_size != 0:
       raise ValueError(f"num_experts={self.num_experts} must be divisible by EP size={ep_size}.")
+
+    # Outside MoE, expert acts as additional data parallelism and tensor
+    # parallelism shards hidden/head dimensions. At the MoE boundary tensor
+    # instead shards sequence; after flattening, all three mesh axes shard the
+    # single token dimension and expert+tensor form one compound EP domain.
+    original_shape = inputs.shape
+    moe_3d_sharding = NamedSharding(
+        self.mesh, P(("fsdp", self._expert_parallelism_name), "tensor", None)
+    )
+    inputs = jax.lax.with_sharding_constraint(inputs, moe_3d_sharding)
+    inputs = inputs.reshape((-1, original_shape[-1]))
+    moe_2d_sharding = NamedSharding(
+        self.mesh, P(("fsdp", self._expert_parallelism_name, "tensor"), None)
+    )
+    inputs = jax.lax.with_sharding_constraint(inputs, moe_2d_sharding)
 
     fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
         self.config.te_gmm_quantization,
@@ -3807,9 +3828,9 @@ class RoutedMoE(nnx.Module):
         aux_loss_coeff=self.config.load_balance_loss_weight,
         apply_topk_weights_early=True,
         quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
-        ep_axis=self._expert_parallelism_name,
+        ep_axis=ep_axes,
         data_parallelism_axes=("fsdp",),
-        input_axes=("activation_batch", "activation_norm_length", None),
+        input_axes=(),
         gate_kernel_axes=self.kernel_axes,
         wi_kernel_axes=self.wi_kernel_axes,
         wo_kernel_axes=self.wo_kernel_axes,
@@ -3817,7 +3838,7 @@ class RoutedMoE(nnx.Module):
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
-    output = output.astype(self.dtype)
+    output = output.astype(self.dtype).reshape(original_shape)
     if lb_loss is not None:
       lb_loss = lb_loss.astype(self.dtype)
     if out_sharding is not None:

@@ -1300,16 +1300,38 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   except ImportError as exc:
     raise ImportError("te_moe_block=True requires TransformerEngine with JAX EP MoE support.") from exc
 
-  ep_axis = "expert"
+  ep_axes = ("expert", "tensor")
   fsdp_axis = "fsdp"
-  ep_size = mesh.shape.get(ep_axis, 1)
+  expert_size = mesh.shape.get("expert", 1)
+  tensor_size = mesh.shape.get("tensor", 1)
+  ep_size = int(np.prod([mesh.shape.get(axis, 1) for axis in ep_axes]))
   fsdp_size = mesh.shape.get(fsdp_axis, 1)
 
-  batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  loaded_batch_size, sequence_length = shaped_batch["inputs"].shape[:2]
+  # Fractional per-device batches load at least one example per device and
+  # decimate to the actual training microbatch before the model call. Size EP
+  # buffers for that model-visible batch rather than the padded loader batch.
+  batch_size = int(getattr(config, "micro_batch_size_to_train_on", loaded_batch_size))
+  if batch_size <= 0 or batch_size > loaded_batch_size:
+    raise ValueError(
+        f"TE MoEBlock training batch={batch_size} must be in [1, loaded batch={loaded_batch_size}]."
+    )
   if config.num_experts % ep_size != 0:
     raise ValueError(f"num_experts={config.num_experts} must be divisible by EP size={ep_size}.")
+  if batch_size % (fsdp_size * expert_size) != 0:
+    raise ValueError(
+        f"global batch={batch_size} must be divisible by fsdp*expert="
+        f"{fsdp_size * expert_size} for the TE MoEBlock path."
+    )
+  if sequence_length % tensor_size != 0:
+    raise ValueError(
+        f"sequence length={sequence_length} must be divisible by tensor={tensor_size} "
+        "for the TE MoEBlock path."
+    )
 
-  max_tokens_per_rank = (batch_size // (fsdp_size * ep_size)) * sequence_length
+  max_tokens_per_rank = (batch_size // (fsdp_size * expert_size)) * (
+      sequence_length // tensor_size
+  )
   worst_case_recv_capacity_per_rank = get_moe_recv_capacity_per_rank(
       num_experts=config.num_experts,
       num_experts_per_tok=config.num_experts_per_tok,
@@ -1336,6 +1358,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
       recv_capacity_per_rank,
       hidden_dim,
       drop_on_overflow,
+      ep_axes,
   )
   global _te_moe_bootstrap_signature
   if _te_moe_bootstrap_signature == signature:
@@ -1348,7 +1371,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
   with jax.set_mesh(mesh), mesh:
     max_logging.log(
         "Bootstrapping TE MoE EP: "
-        f"world={jax.process_count()} rank={jax.process_index()} ep={ep_size} "
+        f"world={jax.process_count()} rank={jax.process_index()} ep_axes={ep_axes} ep={ep_size} "
         f"num_experts={config.num_experts} max_tokens_per_rank={max_tokens_per_rank} "
         f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim} "
         f"recv_capacity_factor={recv_capacity_factor} drop_on_overflow={drop_on_overflow}"
@@ -1362,6 +1385,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
         hidden_dim=hidden_dim,
         max_token_dtype=config.dtype,
         drop_on_overflow=drop_on_overflow,
+        ep_axes=ep_axes,
     )
     record_ep_bootstrap_signature_for_moe(
         num_experts=config.num_experts,
