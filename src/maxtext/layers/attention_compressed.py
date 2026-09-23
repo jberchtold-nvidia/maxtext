@@ -44,7 +44,7 @@ from maxtext.layers.initializers import nd_dense_init, NdInitializer, variable_t
 from maxtext.layers.linears import DenseGeneral, DeepSeekV4GroupedLinear
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.layers.quantizations import AqtQuantization as Quant
-from maxtext.kernels import dsv4_cudnn
+from maxtext.kernels import csa_te
 from maxtext.inference.kvcache import KVQuant
 from maxtext.inference import kvcache
 from maxtext.utils.globals import EPS
@@ -332,7 +332,7 @@ def compute_cudnn_csa_prefill_pooling(
 ) -> Tuple[Array, int, None, None, int]:
   """cuDNN ratio-4 training counterpart of ``compute_csa_prefill_chunk_pooling``."""
   sequence = kv.shape[1]
-  compressed = dsv4_cudnn.compress_ratio4(kv, gate, position_bias)
+  compressed = csa_te.compress_ratio4(kv, gate, position_bias)
   if kv_norm is not None:
     compressed = kv_norm(compressed)
   compressed = rotary_emb(compressed, position_ids[:, :sequence:4], unsqueeze_dim=None)
@@ -961,7 +961,7 @@ class DeepseekV4Indexer(nnx.Module):
 
     head_chunk_size = getattr(self.config, "csa_qk_head_chunk_size", 0)
     if use_cudnn_csa:
-      index_scores = dsv4_cudnn.indexer_ratio4(
+      index_scores = csa_te.indexer_ratio4(
           q, compressed, weights, softmax_scale=self.softmax_scale
       )
     elif head_chunk_size > 0:
@@ -1814,7 +1814,7 @@ class CompressedAttention(Attention):
     if use_cudnn_csa:
       if compressed_kv is None or compressed_mask is None or self.sinks is None:
         raise ValueError("cuDNN DSv4 CSA requires compressed KV, indexer mask, and attention sinks")
-      attn_out = dsv4_cudnn.sparse_attention_ratio4(
+      attn_out = csa_te.sparse_attention_ratio4(
           q,
           kv,
           compressed_kv,
