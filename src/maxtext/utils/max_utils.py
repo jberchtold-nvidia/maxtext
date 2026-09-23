@@ -319,7 +319,11 @@ def initialize_jax_for_gpu(raw_keys):
   if os.environ.get("JAX_COORDINATOR_IP") is not None:
     coordinator_ip = str(os.getenv("JAX_COORDINATOR_IP"))
     coordinator_port = str(os.getenv("JAX_COORDINATOR_PORT"))
-    env_var_list = ["CUDA_VISIBLE_DEVICES", "SLURM_STEP_GPUS"]
+    # CUDA_VISIBLE_DEVICES contains physical IDs before CUDA remaps them into
+    # process-local ordinals. Launchers that isolate one GPU per process set
+    # JAX_LOCAL_DEVICE_IDS=0 so distributed initialization selects that local
+    # device rather than reusing the physical ID as a local ordinal.
+    env_var_list = ["JAX_LOCAL_DEVICE_IDS", "CUDA_VISIBLE_DEVICES", "SLURM_STEP_GPUS"]
     for env_var in env_var_list:
       devices = os.getenv(env_var)
       if devices is not None:
