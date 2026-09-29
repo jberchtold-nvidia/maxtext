@@ -18,6 +18,7 @@
 import dataclasses
 import enum
 import functools
+import inspect
 import math
 import random
 from typing import Any, Iterable, Optional, Tuple, Union
@@ -70,6 +71,20 @@ COMBINE = "combine"
 WI_0 = "wi_0"
 WI_1 = "wi_1"
 WO = "wo"
+
+_TE_MOE_CHECKPOINT_NAMES = {
+    "wi_0_checkpoint_name": "moe_mlpwi_0",
+    "wi_1_checkpoint_name": "moe_mlpwi_1",
+    "wo_checkpoint_name": "moe_mlpwo",
+}
+
+
+def _get_te_moe_checkpoint_kwargs(moe_fn) -> dict[str, str]:
+  """Return named-remat arguments supported by the installed TE MoE API."""
+  parameters = inspect.signature(moe_fn).parameters
+  if _TE_MOE_CHECKPOINT_NAMES.keys() <= parameters.keys():
+    return _TE_MOE_CHECKPOINT_NAMES
+  return {}
 
 
 @struct.dataclass
@@ -4311,6 +4326,8 @@ class RoutedMoE(nnx.Module):
         n_expert_groups=self.num_experts,
     )
 
+    checkpoint_kwargs = _get_te_moe_checkpoint_kwargs(te_moe.moe)
+
     output, lb_loss, total_recv_tokens = te_moe.moe(
         inputs,
         gate_kernel,
@@ -4339,6 +4356,7 @@ class RoutedMoE(nnx.Module):
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
+        **checkpoint_kwargs,
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
