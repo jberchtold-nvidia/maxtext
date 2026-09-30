@@ -1115,6 +1115,10 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use TransformerEngine's fused EP MoEBlock for routing, dispatch, grouped GEMM, and combine.",
   )
+  te_moe_quantize_before_fsdp_all_gather: bool = Field(
+      False,
+      description="Quantize TE MoE weight shards before the FSDP all-gather; false quantizes after gathering.",
+  )
   te_ep_overflow_check_every_n_steps: PositiveInt = Field(
       20,
       description=(
@@ -4909,6 +4913,13 @@ class MaxTextConfig(
         raise ValueError("Loss-free load balancing is only supported for the DeepSeek decoder block.")
       if self.te_moe_block and not self.sparse_matmul:
         raise ValueError("te_moe_block=True requires sparse_matmul=True.")
+      if self.te_moe_quantize_before_fsdp_all_gather:
+        if not self.te_moe_block or self.te_gmm_quantization != "te_mxfp8":
+          raise ValueError(
+              "te_moe_quantize_before_fsdp_all_gather=True requires te_moe_block=True and te_gmm_quantization=te_mxfp8."
+          )
+        if self.shard_exp_on_fsdp or self.use_2d_fsdp_sharding:
+          raise ValueError("te_moe_quantize_before_fsdp_all_gather=True requires hidden-dimension FSDP weight sharding.")
       if self.te_moe_block and not self.prefuse_moe_weights:
         raise ValueError("te_moe_block=True requires prefuse_moe_weights=True.")
       if self.te_moe_block and self.routed_bias_update_rate > 0.0:

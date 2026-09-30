@@ -4305,8 +4305,8 @@ class RoutedMoE(nnx.Module):
     fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
         self.config.te_gmm_quantization,
         # Dispatch buffers have one group per (fsdp, ep, local_expert),
-        # while model weights retain their global expert-group shape until
-        # TE's grouped-GEMM partitioning gathers the quantized FSDP shard.
+        # while model weights retain their global expert-group descriptor.
+        # TE owns either the BF16 gather or the opt-in quantized gather.
         n_token_groups=fsdp_size * self.num_experts,
         n_expert_groups=self.num_experts,
     )
@@ -4339,6 +4339,11 @@ class RoutedMoE(nnx.Module):
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
+        weight_gather=(
+            te_moe.WeightGather.quantized(axis="fsdp")
+            if self.config.te_moe_quantize_before_fsdp_all_gather
+            else te_moe.WeightGather.full_precision()
+        ),
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
