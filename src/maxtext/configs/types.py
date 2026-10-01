@@ -1115,6 +1115,10 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use TransformerEngine's fused EP MoEBlock for routing, dispatch, grouped GEMM, and combine.",
   )
+  te_moe_alternate_weight_layout: bool = Field(
+      False,
+      description="Store TE MoE FC1 weights in the cuDNN-native layout; requires cuDNN grouped-GEMM fusion.",
+  )
   te_ep_overflow_check_every_n_steps: PositiveInt = Field(
       20,
       description=(
@@ -4880,6 +4884,8 @@ class MaxTextConfig(
         )
     if self.moe_use_direct_token_gather and self.use_gather_mosaic_kernel:
       raise ValueError("`moe_use_direct_token_gather=True` currently requires `use_gather_mosaic_kernel=False`.")
+    if self.te_moe_alternate_weight_layout and not self.te_moe_block:
+      raise ValueError("te_moe_alternate_weight_layout=True requires te_moe_block=True.")
     if self.num_experts > 1:
       if self.moe_mlp_dim <= 0:
         raise ValueError("moe_mlp_dim must be positive for MoE models (num_experts > 1)")

@@ -20,7 +20,6 @@ import enum
 import functools
 import inspect
 import math
-import os
 import random
 from typing import Any, Iterable, Optional, Tuple, Union
 
@@ -86,17 +85,6 @@ def _get_te_moe_checkpoint_kwargs(moe_fn) -> dict[str, str]:
   """Return supported TE remat names, reusing the WI-0 policy for EP operations."""
   parameters = inspect.signature(moe_fn).parameters
   return {name: label for name, label in _TE_MOE_CHECKPOINT_NAMES.items() if name in parameters}
-
-
-_CUDNN_GROUPED_GEMM_FUSION_ENV = "NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION"
-
-
-def _use_cudnn_native_moe_weight_layout() -> bool:
-  """Whether TE's cuDNN grouped-SwiGLU path owns wi in native [E,2N,K] layout."""
-  value = os.getenv(_CUDNN_GROUPED_GEMM_FUSION_ENV, "0")
-  if value not in ("0", "1"):
-    raise ValueError(f"{_CUDNN_GROUPED_GEMM_FUSION_ENV} must be '0' or '1', got {value!r}")
-  return value == "1"
 
 
 def _to_cudnn_native_moe_weight_layout(wi: jax.Array) -> jax.Array:
@@ -902,9 +890,7 @@ class RoutedMoE(nnx.Module):
       self.wi_kernel_axes = ("exp", "embed_moe", "mlp_moe")
       self.wo_kernel_axes = ("exp", "mlp_moe", "embed_moe")
 
-    self.cudnn_native_wi_layout = (
-        self.config.te_moe_block and _use_cudnn_native_moe_weight_layout()
-    )
+    self.cudnn_native_wi_layout = self.config.te_moe_block and self.config.te_moe_alternate_weight_layout
     if self.cudnn_native_wi_layout:
       # Persistent cuDNN layout is [E,2N,K], so its logical axes follow the
       # physical transpose of MaxText's conventional [E,K,2N] parameter.

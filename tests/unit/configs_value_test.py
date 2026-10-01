@@ -144,6 +144,12 @@ class ConfigTest(absltest.TestCase):
           types.MaxTextConfig(**{**common_config, **overrides})
         self.assertIn(expected_error, str(context.exception))
 
+  def test_te_moe_alternate_weight_layout_requires_te_moe_block(self):
+    self.assertFalse(types.MaxTextConfig(run_name="test").te_moe_alternate_weight_layout)
+    with self.assertRaises(pydantic.ValidationError) as context:
+      types.MaxTextConfig(run_name="test", te_moe_alternate_weight_layout=True)
+    self.assertIn("te_moe_alternate_weight_layout=True requires te_moe_block=True", str(context.exception))
+
   def test_te_moe_block_uses_ragged_buffer_factor_validation(self):
     common_config = {
         "run_name": "test",
