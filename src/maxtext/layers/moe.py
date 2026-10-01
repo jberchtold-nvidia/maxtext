@@ -76,15 +76,15 @@ _TE_MOE_CHECKPOINT_NAMES = {
     "wi_0_checkpoint_name": "moe_mlpwi_0",
     "wi_1_checkpoint_name": "moe_mlpwi_1",
     "wo_checkpoint_name": "moe_mlpwo",
+    "dispatch_checkpoint_name": "moe_mlpwi_0",
+    "combine_checkpoint_name": "moe_mlpwi_0",
 }
 
 
 def _get_te_moe_checkpoint_kwargs(moe_fn) -> dict[str, str]:
-  """Return named-remat arguments supported by the installed TE MoE API."""
+  """Return supported TE remat names, reusing the WI-0 policy for EP operations."""
   parameters = inspect.signature(moe_fn).parameters
-  if _TE_MOE_CHECKPOINT_NAMES.keys() <= parameters.keys():
-    return _TE_MOE_CHECKPOINT_NAMES
-  return {}
+  return {name: label for name, label in _TE_MOE_CHECKPOINT_NAMES.items() if name in parameters}
 
 
 @struct.dataclass
