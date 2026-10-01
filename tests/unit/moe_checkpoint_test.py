@@ -33,8 +33,6 @@ def test_te_moe_checkpoint_kwargs_for_supported_signature():
       "wi_0_checkpoint_name": "moe_mlpwi_0",
       "wi_1_checkpoint_name": "moe_mlpwi_1",
       "wo_checkpoint_name": "moe_mlpwo",
-      "dispatch_checkpoint_name": "moe_mlpwi_0",
-      "combine_checkpoint_name": "moe_mlpwi_0",
   }
 
 
@@ -63,9 +61,7 @@ def test_te_moe_checkpoint_kwargs_for_ep_only_signature():
   def te_moe(*, dispatch_checkpoint_name=None):
     del dispatch_checkpoint_name
 
-  assert moe._get_te_moe_checkpoint_kwargs(te_moe) == {
-      "dispatch_checkpoint_name": "moe_mlpwi_0",
-  }
+  assert moe._get_te_moe_checkpoint_kwargs(te_moe) == {}
 
 
 def test_te_moe_checkpoint_kwargs_for_legacy_signature():
