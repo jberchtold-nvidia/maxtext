@@ -1548,6 +1548,7 @@ DEFAULT_LOGICAL_AXIS_RULES: list[list] = [
     ["activation_exp", ["expert"]],
     # MoE Weights
     ["exp", "expert"],
+    ["expert_weight_fsdp", ["expert", "fsdp"]],
     ["mlp_moe", ["fsdp_transpose", "tensor", "tensor_sequence", "autoregressive"]],
     ["embed_moe", ["fsdp", "fsdp_transpose", "context", "context_usp_ulysses"]],
     ["embed_moe", ["fsdp", "context", "context_usp_ulysses"]],
@@ -4924,8 +4925,8 @@ class MaxTextConfig(
           raise ValueError(
               "te_moe_quantize_before_fsdp_all_gather=True requires te_moe_block=True and te_gmm_quantization=te_mxfp8."
           )
-        if self.shard_exp_on_fsdp or self.use_2d_fsdp_sharding:
-          raise ValueError("te_moe_quantize_before_fsdp_all_gather=True requires hidden-dimension FSDP weight sharding.")
+        if self.use_2d_fsdp_sharding:
+          raise ValueError("te_moe_quantize_before_fsdp_all_gather=True does not support 2D FSDP weight sharding.")
       if self.te_moe_block and not self.prefuse_moe_weights:
         raise ValueError("te_moe_block=True requires prefuse_moe_weights=True.")
       if self.te_moe_block and self.routed_bias_update_rate > 0.0:

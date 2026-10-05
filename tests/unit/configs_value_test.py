@@ -163,6 +163,9 @@ class ConfigTest(absltest.TestCase):
         "override_logical_axis_rules": True,
     }
     self.assertTrue(types.MaxTextConfig(**common).te_moe_quantize_before_fsdp_all_gather)
+    self.assertTrue(
+        types.MaxTextConfig(**common, shard_exp_on_fsdp=True).te_moe_quantize_before_fsdp_all_gather
+    )
     self.assertFalse(
         types.MaxTextConfig(
             **{**common, "te_moe_quantize_before_fsdp_all_gather": False}
@@ -170,7 +173,6 @@ class ConfigTest(absltest.TestCase):
     )
     for overrides in (
         {"te_gmm_quantization": "te_no_quant"},
-        {"shard_exp_on_fsdp": True},
         {"use_2d_fsdp_sharding": True},
         {"te_moe_quantize_before_fsdp_all_gather": "invalid"},
     ):
