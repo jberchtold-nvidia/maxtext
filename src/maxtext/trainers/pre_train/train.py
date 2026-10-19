@@ -641,6 +641,10 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   else:
     state.apply_gradients(grads)
   new_state = state
+  if config.decoder_block.value == "kimi_k3" and config.kimi_quantile_balancing:
+    from maxtext.models.kimi_k3 import finalize_balancing  # pylint: disable=import-outside-toplevel
+
+    diag_bias_values, diag_bias_updates = finalize_balancing(new_state.model, aux.get("te_moe_capacity_overflow", False))
 
   # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
   # pylint: disable=too-many-nested-blocks

@@ -661,7 +661,7 @@ class GateLogit(nnx.Module):
     if self.use_bias:
       bias_axes = self.kernel_axes[-len(self.out_features_shape) :]
       bias_shape = kernel_shape[-len(self.out_features_shape) :]
-      if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+      if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "kimi-k3")):
         # DeepSeek uses MoEBiasVar to naturally isolate from sequence-wise updates.
         self.bias = MoEBiasVar(
             default_bias_init(rngs.params(), bias_shape, self.bias_dtype),
@@ -727,7 +727,7 @@ class GateLogit(nnx.Module):
       output = linears._convert_to_activation_function(self.score_func)(output)
 
     # NOTE: deepseek2 has a different pattern
-    if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+    if self.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "kimi-k3")):
       pre_bias_logits = output
 
     if self.use_bias:
@@ -1369,7 +1369,7 @@ class RoutedMoE(nnx.Module):
         top_k_indices = tid2eid_int[input_ids.astype(jnp.int32)]
         top_k_weights = jnp.take_along_axis(pre_bias_logits, top_k_indices, axis=-1)
       # NOTE: deepseek2 has a different pattern
-      elif self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+      elif self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "kimi-k3")):
         top_k_weights, top_k_indices = self.deepseek_routing(gate_logits, pre_bias_logits)
       elif self.config.decoder_block == ctypes.DecoderBlockType.GEMMA4:
         router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
@@ -2574,7 +2574,7 @@ class RoutedMoE(nnx.Module):
 
       gate_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
       # NOTE: deepseek2 has a different pattern
-      if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+      if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "kimi-k3")):
         pre_bias_logits_pspec = self._logical_to_mesh_axes((batch_logical_axis, "activation_norm_length", None))
       else:
         # pre_bias_logits is None for non-deepseek3/4 models, including deepseek2
@@ -3928,7 +3928,7 @@ class RoutedMoE(nnx.Module):
     gate_logits_logical_axes = (batch_logical_axis, "activation_norm_length", None)
     pre_bias_logits_logical_axes = (
         (batch_logical_axis, "activation_norm_length", None)
-        if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2"))
+        if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "kimi-k3"))
         else None
     )
     inputs = self._maybe_shard_with_pspec(inputs, input_partition_pspec, logical_axes=input_logical_axes)
@@ -4368,7 +4368,7 @@ class RoutedMoE(nnx.Module):
     # gate_logits: batch, length, expert
     gate_logits = self._maybe_shard_with_logical(gate_logits, ("activation_batch_moe", "activation_length_moe", None))
     # NOTE: deepseek2 has a different pattern
-    if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2")):
+    if self.config.model_name.startswith(("deepseek3", "deepseek4", "kimi-k2", "kimi-k3")):
       # pre_bias_logits is None for non-deepseek3/4 models, including deepseek2
       pre_bias_logits = self._maybe_shard_with_logical(
           pre_bias_logits, ("activation_batch_moe", "activation_length_moe", None)
@@ -4896,6 +4896,20 @@ class RoutedMoE(nnx.Module):
 
     checkpoint_kwargs = _get_te_moe_checkpoint_kwargs(te_moe.moe)
 
+    # Existing installed TE releases use physical ep/data axes; newer releases
+    # accept MeshResource. Select by capability without changing TE or routing.
+    te_parameters = inspect.signature(te_moe.moe).parameters
+    if "mesh_resource" in te_parameters:
+      parallel_kwargs = dict(
+          mesh_resource=MeshResource(dp_resource="data", fsdp_resource="fsdp", ep_resource=self._expert_parallelism_name)
+      )
+    else:
+      parallel_kwargs = dict(ep_axis=self._expert_parallelism_name, data_parallelism_axes=("data", "fsdp"))
+    if "quant_before_fsdp_ag" in te_parameters:
+      parallel_kwargs["quant_before_fsdp_ag"] = self.config.te_moe_quantize_before_fsdp_all_gather
+    elif self.config.te_moe_quantize_before_fsdp_all_gather:
+      raise ValueError("Installed TE MoEBlock does not support quantization before FSDP all-gather.")
+
     output, lb_loss, total_recv_tokens = te_moe.moe(
         inputs,
         gate_kernel,
@@ -4916,14 +4930,13 @@ class RoutedMoE(nnx.Module):
         aux_loss_coeff=self.config.load_balance_loss_weight,
         apply_topk_weights_early=True,
         quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
-        mesh_resource=MeshResource(dp_resource="data", fsdp_resource="fsdp", ep_resource=self._expert_parallelism_name),
         input_axes=("activation_batch", "activation_norm_length", None),
         gate_kernel_axes=self.kernel_axes,
         wi_kernel_axes=self.wi_kernel_axes,
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
-        quant_before_fsdp_ag=self.config.te_moe_quantize_before_fsdp_all_gather,
+        **parallel_kwargs,
         **checkpoint_kwargs,
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()

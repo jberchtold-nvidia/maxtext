@@ -1699,3 +1699,17 @@ elastic_snapshot_interval: 10
 elastic_timeout_seconds: 300
 elastic_max_retries: 10
 elastic_min_slice_count: -1
+
+# Kimi-K3 TE surrogate: see docs/guides/kimi_k3_te_compatibility.md.
+kimi_te_surrogate: false
+kimi_full_attn_layers: []
+kimi_kda_heads: 96
+kimi_kda_head_dim: 128
+kimi_conv_size: 4
+kimi_chunk_size: 64
+kimi_gate_lower_bound: -5.0
+kimi_attn_res_block_size: 12
+kimi_situ_beta: 4.0
+kimi_situ_linear_beta: 25.0
+kimi_qb_bins: 256
+kimi_quantile_balancing: true

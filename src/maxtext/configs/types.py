@@ -41,7 +41,7 @@ from pydantic.config import ConfigDict
 from pydantic.fields import Field
 from pydantic.functional_validators import field_validator, model_validator
 from pydantic.main import BaseModel
-from pydantic.types import NonNegativeFloat, NonNegativeInt, PositiveInt
+from pydantic.types import NonNegativeFloat, NonNegativeInt, PositiveInt, PositiveFloat
 
 
 class XProfTPUPowerTraceMode(enum.IntEnum):  # pylint: disable=invalid-name
@@ -257,6 +257,9 @@ ModelName = Literal[
     "deepseek4-1600b",
     "deepseek-custom",
     "kimi-k2-1t",
+    "kimi-k3-2.8t",
+    "kimi-k3-2.8t-te-surrogate",
+    "kimi-k3-tiny-te-surrogate",
     "gemma-7b",
     "gemma-2b",
     "gemma2-2b",
@@ -1306,6 +1309,21 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use Ring of Experts for sparse matmul expert parallelism.",
   )
+  # K3-TE-001/002: explicit approximation, persisted in resolved configs/checkpoints.
+  # See docs/guides/kimi_k3_te_compatibility.md; never silently enable this.
+  kimi_te_surrogate: bool = False
+  kimi_full_attn_layers: list[int] = Field(default_factory=list)
+  kimi_kda_heads: PositiveInt = 96
+  kimi_kda_head_dim: PositiveInt = 128
+  kimi_conv_size: PositiveInt = 4
+  kimi_chunk_size: PositiveInt = 64
+  kimi_gate_lower_bound: float = -5.0
+  kimi_attn_res_block_size: PositiveInt = 12
+  kimi_situ_beta: PositiveFloat = 4.0
+  kimi_situ_linear_beta: PositiveFloat = 25.0
+  kimi_qb_bins: PositiveInt = 256
+  kimi_quantile_balancing: bool = True
+
   te_moe_block: bool = Field(
       False,
       description="Whether to use TransformerEngine's fused EP MoEBlock for routing, dispatch, grouped GEMM, and combine.",
@@ -5613,6 +5631,67 @@ class MaxTextConfig(
         )
     if self.moe_use_direct_token_gather and self.use_gather_mosaic_kernel:
       raise ValueError("`moe_use_direct_token_gather=True` currently requires `use_gather_mosaic_kernel=False`.")
+    if self.decoder_block == DecoderBlockType.KIMI_K3:
+      if not self.kimi_te_surrogate:
+        raise ValueError(
+            "Exact Kimi-K3 is blocked by TE: separate router/expert inputs and two-branch SiTU-GLU "
+            "are unsupported. Select an explicit TE surrogate config; see "
+            "docs/guides/kimi_k3_te_compatibility.md (K3-TE-001/002)."
+        )
+      if not self.te_moe_block or not self.sparse_matmul or not self.prefuse_moe_weights:
+        raise ValueError("Kimi-K3 surrogate requires full TE MoEBlock, sparse_matmul and prefused weights.")
+      if self.quantization or self.use_qwix_quantization or self.use_manual_quantization:
+        raise ValueError("Kimi-K3 requires native non-MoE operations: quantization must be empty.")
+      if self.packing or self.use_multimodal or self.mtp_num_layers or self.using_pipeline_parallelism:
+        raise ValueError("Kimi-K3 currently supports unpacked text training without MTP or pipeline parallelism.")
+      if any(
+          getattr(self, name) != 1
+          for name in (
+              "ici_tensor_parallelism",
+              "dcn_tensor_parallelism",
+              "ici_context_parallelism",
+              "dcn_context_parallelism",
+              "ici_tensor_sequence_parallelism",
+              "dcn_tensor_sequence_parallelism",
+          )
+      ):
+        raise ValueError(
+            "Kimi-K3 currently supports EP/FSDP training with tensor/context/sequence parallelism equal to one."
+        )
+      if self.param_scan_axis != 0:
+        raise ValueError("Kimi-K3 stores scanned residual-block parameters on leading axis zero.")
+      if not self.float32_gate_logits or self.mlp_bias or self.shared_experts != 2:
+        raise ValueError("Kimi-K3 requires FP32 router logits, bias-free FFNs, and two shared experts.")
+      if self.n_routing_groups > 1 or self.topk_routing_group > 1:
+        raise ValueError("Kimi-K3 uses one routing group; grouped routing would change its architecture.")
+      if self.first_num_dense_layers != 1 or self.num_decoder_layers < 2:
+        raise ValueError("Kimi-K3 requires one dense prefix layer and at least one MoE layer.")
+      if self.moe_expert_input_dim <= 0 or self.num_experts <= self.num_experts_per_tok:
+        raise ValueError("Kimi-K3 requires a positive latent width and num_experts > top-k for quantile balancing.")
+      if self.routed_score_func != "sigmoid" or not self.norm_topk_prob or not self.routed_bias:
+        raise ValueError("Kimi-K3 requires normalized sigmoid routing with expert-selection bias.")
+      if self.routed_bias_update_rate or self.load_balance_loss_weight or self.routed_scaling_factor != 1.0:
+        raise ValueError("Kimi-K3 uses quantile balancing, no sign/auxiliary updates, and routing scale 1.")
+      if self.mlp_activations != ("silu", "linear") and list(self.mlp_activations) != ["silu", "linear"]:
+        raise ValueError("Kimi-K3 TE surrogate routed activation must be SwiGLU.")
+      if self.kimi_gate_lower_bound >= 0 or self.kimi_qb_bins < 2:
+        raise ValueError("Kimi-K3 needs negative decay lower bound and at least two histogram bins.")
+      full = self.kimi_full_attn_layers
+      if len(set(full)) != len(full) or any(i < 1 or i > self.num_decoder_layers for i in full):
+        raise ValueError("Kimi-K3 full-attention layers must be unique one-based layer indices.")
+      block = self.kimi_attn_res_block_size
+      prefix = min(block, self.num_decoder_layers)
+      middle = max((self.num_decoder_layers - prefix - 1) // block, 0) if self.scan_layers else 0
+      for start in range(prefix, prefix + middle * block, block):
+        if [i - start for i in full if start < i <= start + block] != [
+            i - prefix for i in full if prefix < i <= prefix + block
+        ]:
+          raise ValueError("Kimi-K3 scanned residual blocks must have identical attention schedules.")
+      if self.dtype != DType.BFLOAT16 or self.weight_dtype != DType.BFLOAT16:
+        raise ValueError("Kimi-K3 TE training currently requires BF16 parameters and activations.")
+      if self.shard_exp_on_fsdp or self.use_2d_fsdp_sharding or self.moe_flat_fsdp_weights:
+        raise ValueError("Kimi-K3 currently uses standard TE expert/FSDP weight sharding.")
+
     if self.num_experts > 1:
       if self.moe_mlp_dim <= 0:
         raise ValueError("moe_mlp_dim must be positive for MoE models (num_experts > 1)")
@@ -5653,7 +5732,7 @@ class MaxTextConfig(
         raise ValueError("te_moe_block=True requires prefuse_moe_weights=True.")
       if self.te_moe_block and self.routed_bias_update_rate > 0.0:
         raise ValueError("te_moe_block=True does not currently support routed_bias_update_rate > 0.")
-      if self.te_moe_block and self.norm_topk_prob:
+      if self.te_moe_block and self.norm_topk_prob and self.decoder_block != DecoderBlockType.KIMI_K3:
         raise ValueError("te_moe_block=True does not currently support norm_topk_prob=True.")
       if self.te_moe_block and self.use_random_routing:
         raise ValueError("te_moe_block=True does not support use_random_routing=True.")
@@ -6695,10 +6774,8 @@ class RLConfig(
         self.tokenizer_path = HF_IDS[model_name]
         self.tokenizer_type = TokenizerType.HUGGINGFACE
       else:
-        raise ValueError(
-            "model_name not found in HF_IDS in maxtext/src/maxtext/utils/globals.py. \
-          Please pass tokenizer_path in your command."
-        )
+        raise ValueError("model_name not found in HF_IDS in maxtext/src/maxtext/utils/globals.py. \
+          Please pass tokenizer_path in your command.")
 
     if self.optimizer_memory_host_offload:
       raise ValueError(

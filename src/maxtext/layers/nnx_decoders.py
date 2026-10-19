@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Module for decoder layers"""
+
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
@@ -49,6 +50,7 @@ from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.models import (
     deepseek,
     deepseek4,
+    kimi_k3,
     deepseek_batchsplit,
     deepseek_batchsplit_fp8,
     envy,
@@ -596,7 +598,9 @@ class NNXDecoder(nnx.Module):
     """Routes layer construction through three main paths: pipeline, scanned non-pipeline, sequential."""
     config = self.config
 
-    if self.is_gemma4_small:
+    if config.decoder_block == DecoderBlockType.KIMI_K3:
+      self.kimi_backbone = kimi_k3.KimiBackbone(config, mesh, rngs)
+    elif self.is_gemma4_small:
       # Gemma4 E2B/E4B: per-layer-index KV-share donor threading and a distinct attention_type
       # per layer are not expressible inside jax.lax.scan; pipeline parallelism is also unsupported.
       if getattr(config, "using_pipeline_parallelism", False) or getattr(config, "scan_layers", False):
@@ -1353,6 +1357,7 @@ class NNXDecoder(nnx.Module):
 
     layer_map = {
         DecoderBlockType.DEFAULT: [NNXDecoderLayer],
+        DecoderBlockType.KIMI_K3: [kimi_k3.KimiLayer],
         DecoderBlockType.LLAMA2: [llama2.LlamaDecoderLayer],
         DecoderBlockType.MISTRAL: [mistral.MistralDecoderLayer],
         DecoderBlockType.MIXTRAL: [mixtral.MixtralDecoderLayer],
@@ -1524,6 +1529,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.MIXTRAL,
         DecoderBlockType.DEEPSEEK,
         DecoderBlockType.DEEPSEEK4,
+        DecoderBlockType.KIMI_K3,
         DecoderBlockType.GEMMA,
         DecoderBlockType.GEMMA2,
         DecoderBlockType.GEMMA3,
@@ -2116,7 +2122,12 @@ class NNXDecoder(nnx.Module):
                   kv_caches[kv_idx] = out[1]
 
     else:
-      if self.is_gemma4_small:
+      if cfg.decoder_block == DecoderBlockType.KIMI_K3:
+        if model_mode != MODEL_MODE_TRAIN:
+          raise ValueError("Kimi-K3 currently supports training-mode full-sequence execution only.")
+        segments = decoder_segment_ids if decoder_segment_ids is not None else jnp.ones(y.shape[:2], jnp.int32)
+        y = self.kimi_backbone(y, segments, cfg.kimi_quantile_balancing)
+      elif self.is_gemma4_small:
         y, kv_caches = self._apply_gemma4_small_layers(
             y,
             decoder_input_tokens,
